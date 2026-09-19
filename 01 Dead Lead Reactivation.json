@@ -1,0 +1,438 @@
+{
+  "name": "Dead Lead Reactivation",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT l.* FROM leads l\nLEFT JOIN suppression_list s ON s.email = l.email\nWHERE l.status IN ('dead','in_reactivation')\n  AND l.touch_count < 3\n  AND (l.next_touch_at IS NULL OR l.next_touch_at <= NOW())\n  AND l.replied_at IS NULL\n  AND s.email IS NULL\nORDER BY l.deal_value DESC\nLIMIT 10;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        224,
+        0
+      ],
+      "id": "46d9a159-ba8b-419b-88b5-b950f742bdc2",
+      "name": "Fetch Due Leads",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const angles = {\n  0: { goal: \"soft re-open, no pitch, ask if the problem still exists\",\n       cta: \"a one-line reply telling me if this is still on your plate\" },\n  1: { goal: \"share one specific insight or result relevant to their industry\",\n       cta: \"ask if they want the 2-minute breakdown\" },\n  2: { goal: \"polite breakup email, give them an easy exit\",\n       cta: \"reply 'no' and I'll close your file\" }\n};\n\nreturn $input.all().map(item => {\n  const l = item.json;\n  const daysCold = Math.floor(\n    (Date.now() - new Date(l.last_contact_date)) / 86400000\n  );\n  const priority = (l.deal_value > 5000 ? 2 : 1) + (daysCold > 365 ? 0 : 1);\n\n  return {\n    json: {\n      ...l,\n      days_cold: daysCold,\n      priority,\n      angle: angles[l.touch_count].goal,\n      cta: angles[l.touch_count].cta\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        0
+      ],
+      "id": "c3122126-7c04-48a7-8659-8bbad44a1d8b",
+      "name": "Score & Assign Touch Strategy"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        672,
+        0
+      ],
+      "id": "b2749616-d6d8-48f5-adb1-69f88e8a7138",
+      "name": "Process Leads One at a Time"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a B2B email copywriter. You write short, plain, human re-engagement emails.\n\nSTRICT FORMAT RULES - failure to follow these makes the output unusable:\n1. The body MUST start with \"Hi {first_name},\" using the exact first name given.\n2. The body MUST be AT LEAST 60 words and NO MORE than 90 words. If your draft is under 60 words, add another sentence with a relevant, specific detail before finishing. Count your words before responding.\n3. Do not write: \"I hope this email finds you well\", \"circling back\", \"touching base\", \"hope you're well\".\n4. No em-dashes. No exclamation marks. No bullet points.\n5. Reference the specific lost_reason naturally, once, in your own words.\n6. End with exactly one question, matching the given CTA.\n7. Never invent facts, prices, case studies, or names not given to you.\n8. Sign the body as \"CJ\" on its own line at the end.\n\nReturn ONLY valid JSON, no markdown fences, no explanation before or after:\n{\"subject\": \"...\", \"body\": \"...\", \"personalization_note\": \"...\"}"
+            },
+            {
+              "content": "=Lead: {{ $json.first_name }} at {{ $json.company }}\nWent cold {{ $json.days_cold }} days ago.\nReason we lost them: {{ $json.lost_reason }}\nPrevious deal value: {{ $json.deal_value }}\n\nEmail goal: {{ $json.angle }}\nCall to action: {{ $json.cta }}\n\nWrite the email. Sign as \"CJ\"."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        928,
+        16
+      ],
+      "id": "b1689509-566c-48bc-9b1f-86de70533417",
+      "name": "Generate Email Draft",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output?.[0]?.content?.[0]?.text ?? $json.message?.content ?? $json.content ?? \"\";\nlet parsed;\ntry {\n  parsed = typeof raw === \"string\"\n    ? JSON.parse(raw.replace(/```json|```/g, \"\").trim())\n    : raw;\n} catch (e) {\n  return [{ json: { ...$('Process Leads One at a Time').item.json, valid: false, fail: \"unparseable\" } }];\n}\n\nconst body = (parsed.body || \"\").trim();\nconst words = body.split(/\\s+/).length;\n\n// Strip whatever sign-off the model wrote\nconst cleanBody = body\n  .replace(/\\n*\\s*(best regards|regards|thanks|thank you|sincerely)?[,]?\\s*\\n*\\s*CJ\\s*$/i, '')\n  .trim();\n\nconst emailBody = `${cleanBody}\\n\\nBest regards,\\nCJ`;\n\nconst paragraphs = cleanBody\n  .split(/\\n+/)\n  .filter(p => p.trim())\n  .map(p => `<p style=\"margin:0 0 16px 0; font-size:15px; line-height:1.6; color:#2d2d2d;\">${p.trim()}</p>`)\n  .join('');\n\nconst emailBodyHtml = `\n<div style=\"font-family: Arial, Helvetica, sans-serif; max-width:560px; margin:0 auto; padding:0;\">\n  <div style=\"padding:20px 24px; border-bottom:2px solid #1a1a1a;\">\n    <span style=\"font-size:16px; font-weight:bold; color:#1a1a1a; letter-spacing:0.5px;\">CJ FRANCO</span>\n    <span style=\"font-size:12px; color:#888; margin-left:8px;\">Web &amp; Automation Development</span>\n  </div>\n  <div style=\"padding:24px;\">\n    ${paragraphs}\n    <p style=\"margin:24px 0 0 0; font-size:15px; line-height:1.6; color:#2d2d2d;\">\n      Best regards,<br>\n      <strong>CJ</strong>\n    </p>\n  </div>\n  <div style=\"padding:16px 24px; border-top:1px solid #e5e5e5; font-size:11px; color:#999; line-height:1.5;\">\n    You're receiving this because we worked together previously.\n    If you'd rather not hear from us again, just reply with \"unsubscribe\" and we'll remove you from this list.\n  </div>\n</div>\n`.trim();\n\nconst checks = {\n  hasBody:        body.length > 40,\n  lengthOk:       words >= 40 && words <= 140,\n  noPlaceholders: !/\\[.*?\\]|\\{\\{.*?\\}\\}|XYZ|Lorem/i.test(body),\n  noAiTells:      !/as an AI|I hope this email finds you well|circling back/i.test(body),\n  hasSubject:     (parsed.subject || \"\").length > 5 && parsed.subject.length < 70,\n  nameCorrect:    body.includes($('Process Leads One at a Time').item.json.first_name)\n};\n\nconst failed = Object.entries(checks).filter(([,v]) => !v).map(([k]) => k);\n\n// Prefix the subject deterministically - never trust the AI to add this reliably\nconst finalSubject = `[Reactivation] ${parsed.subject || ''}`;\n\nreturn [{ json: {\n  ...$('Process Leads One at a Time').item.json,\n  subject: finalSubject,\n  body,\n  emailBody,\n  emailBodyHtml,\n  valid: failed.length === 0,\n  fail: failed.join(\",\")\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1248,
+        16
+      ],
+      "id": "75717915-f137-42bc-9ade-5f98f3ecf799",
+      "name": "Validate Draft (QC Guardrail)"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "db79c29b-9b03-4bba-85a5-e02b9799e71d",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1472,
+        16
+      ],
+      "id": "8887c9ba-a388-4d17-a65e-c43708b8d234",
+      "name": "Draft Passed QC?"
+    },
+    {
+      "parameters": {
+        "fromEmail": "franco.cj03@gmail.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "={{ $json.subject }}",
+        "html": "={{ $json.emailBodyHtml }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1728,
+        -176
+      ],
+      "id": "947e954c-2f75-402c-93ef-862bbce451ac",
+      "name": "Send Reactivation Email",
+      "webhookId": "202d178f-22fc-4c7b-bfad-fba81caa5de0",
+      "credentials": {
+        "smtp": {
+          "id": "4jlPLz6lxGd7NpWX",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 4
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2016,
+        -176
+      ],
+      "id": "91533475-6ed8-4d08-a22a-4a1619034475",
+      "name": "Throttle Delay",
+      "webhookId": "b59e744f-fe29-4b05-aa30-2206583f136e"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET\n  status = 'in_reactivation',\n  touch_count = touch_count + 1,\n  last_contact_date = CURRENT_DATE,\n  last_sent_body = '{{ $('Validate Draft (QC Guardrail)').item.json.body.replace(/'/g, \"''\") }}',\n  next_touch_at = NOW() + INTERVAL '4 days'\nWHERE id = {{ $('Process Leads One at a Time').item.json.id }};",
+        "options": {
+          "queryReplacement": "={{ $('Process Leads One at a Time').item.json.id }},{{ $('Validate Draft (QC Guardrail)').item.json.body }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2288,
+        -176
+      ],
+      "id": "9d93e960-62f5-4f10-8494-1c6b856aabd2",
+      "name": "Update Lead — Touch Sent",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET status = 'exhausted' WHERE touch_count >= 3 AND replied_at IS NULL;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2288,
+        192
+      ],
+      "id": "defa96f0-69dd-4db8-9c57-eb62ed4c259e",
+      "name": "Flag Exhausted Leads",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const reasons = {\n  hasBody:        \"the email body came back empty or too short to be usable\",\n  lengthOk:       \"the email length was outside the target range\",\n  noPlaceholders: \"the draft contained leftover placeholder text\",\n  noAiTells:      \"the draft used generic phrasing we don't want in outbound emails\",\n  hasSubject:     \"the subject line was missing or badly formed\",\n  nameCorrect:    \"the lead's name wasn't used correctly in the email\"\n};\n\nconst item = $input.first().json;\nconst failedChecks = (item.fail || \"\").split(\",\").filter(Boolean);\nconst explanations = failedChecks.map(f => reasons[f] || f);\n\nconst summary = explanations.length === 1\n  ? explanations[0]\n  : explanations.slice(0, -1).join(\", \") + \" and \" + explanations[explanations.length - 1];\n\nconst message =\n  `⚠️ A draft email needs review\\n\\n` +\n  `Lead: ${item.first_name} — ${item.company}\\n` +\n  `Contact: ${item.email}\\n\\n` +\n  `Reason: ${summary}.\\n\\n` +\n  `This email was held back automatically and was not sent. No action needed unless you want to review or send it manually.`;\n\nreturn [{ json: { ...item, alert_message: message } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1728,
+        192
+      ],
+      "id": "49c66f17-930f-4aaf-b089-05a5361302e1",
+      "name": "Build Failure Alert Message"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "={{ $json.alert_message }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2016,
+        192
+      ],
+      "id": "b8c46754-b091-4a9a-8875-c4d0602a0dc5",
+      "name": "Notify via Telegram",
+      "webhookId": "68de7a4a-c39c-4980-9ebc-1b53efb9324a",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "a145c075-6bba-44c6-b1d4-140838f18140",
+      "name": "Execute workflow"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Fetch Due Leads": {
+      "main": [
+        [
+          {
+            "node": "Score & Assign Touch Strategy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score & Assign Touch Strategy": {
+      "main": [
+        [
+          {
+            "node": "Process Leads One at a Time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Leads One at a Time": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Generate Email Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Email Draft": {
+      "main": [
+        [
+          {
+            "node": "Process Leads One at a Time",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Validate Draft (QC Guardrail)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Draft (QC Guardrail)": {
+      "main": [
+        [
+          {
+            "node": "Draft Passed QC?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Passed QC?": {
+      "main": [
+        [
+          {
+            "node": "Send Reactivation Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Alert Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reactivation Email": {
+      "main": [
+        [
+          {
+            "node": "Throttle Delay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Throttle Delay": {
+      "main": [
+        [
+          {
+            "node": "Update Lead — Touch Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Lead — Touch Sent": {
+      "main": [
+        [
+          {
+            "node": "Flag Exhausted Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Exhausted Leads": {
+      "main": [
+        [
+          {
+            "node": "Process Leads One at a Time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Failure Alert Message": {
+      "main": [
+        [
+          {
+            "node": "Notify via Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify via Telegram": {
+      "main": [
+        [
+          {
+            "node": "Process Leads One at a Time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute workflow": {
+      "main": [
+        [
+          {
+            "node": "Fetch Due Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "b6f42e88-c6f5-4a84-96f9-ca4e55bba43d",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "du5Ly1kOabnMLzK0",
+  "tags": []
+}

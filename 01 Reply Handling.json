@@ -1,0 +1,522 @@
+{
+  "name": "Reply Handling",
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "Reactivation",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "c4d89868-e1dc-422f-91d4-5c780a07ef8c",
+      "name": "Email Trigger (IMAP)",
+      "credentials": {
+        "imap": {
+          "id": "dVc9Ye84ZzY50NgT",
+          "name": "IMAP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Classify this email reply into exactly one category.\n\nCategories:\nINTERESTED - wants to talk, asks about pricing or availability\nQUESTION - asks something but is not committing\nNOT_NOW - interested later, says busy or wrong timing\nNOT_INTERESTED - declines\nUNSUBSCRIBE - asks to stop contact, angry, or legal language\nAUTO_REPLY - out of office, bounce, autoresponder\n\nReturn ONLY: {\"category\":\"...\", \"confidence\":0.0-1.0, \"summary\":\"under 15 words\"}"
+            },
+            {
+              "content": "={{ $('Extract Reply Text').item.json.reply }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        672,
+        0
+      ],
+      "id": "b3f88cdb-a0ac-4d8f-bb3b-ffefef761a65",
+      "name": "Message a model",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM leads WHERE email = '{{ $json.from.replace(/'/g, \"''\") }}' AND replied_at IS NULL LIMIT 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        448,
+        0
+      ],
+      "id": "c7b87b97-c724-452d-909f-133efbee0699",
+      "name": "Find Matching Lead",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const YOUR_EMAIL = 'franco.cj03@gmail.com';\n\nconst rawFrom = $json.from?.value?.[0]?.address || $json.from || '';\nconst emailMatch = rawFrom.match(/[\\w.+-]+@[\\w-]+\\.[\\w.-]+/);\nconst fromAddress = emailMatch ? emailMatch[0] : rawFrom;\n\n// Skip anything that's actually from you (your own sent copies picked up by the label)\nif (fromAddress.toLowerCase() === YOUR_EMAIL.toLowerCase()) {\n  return [];\n}\n\nconst body = $json.textPlain || $json.text || $json.textHtml?.replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ') || \"\";\nconst clean = body.split(/On .* wrote:|-----Original Message-----|^>/m)[0].trim();\n\nreturn [{ json: { from: fromAddress, reply: clean.slice(0, 1500) } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "id": "41f17083-05b3-453c-a98b-5a695e7c4ab7",
+      "name": "Extract Reply Text"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output?.[0]?.content?.[0]?.text ?? $json.message?.content ?? $json.content ?? \"\";\nlet parsed;\ntry {\n  parsed = typeof raw === \"string\"\n    ? JSON.parse(raw.replace(/```json|```/g, \"\").trim())\n    : raw;\n} catch (e) {\n  parsed = { category: \"PARSE_ERROR\", confidence: 0, summary: \"Could not parse classification\" };\n}\n\nreturn [{ json: {\n  ...$('Find Matching Lead').item.json,\n  category: parsed.category,\n  confidence: parsed.confidence,\n  summary: parsed.summary,\n  reply_text: $('Extract Reply Text').item.json.reply\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        0
+      ],
+      "id": "927745ff-263c-4140-8257-30faad95ae82",
+      "name": "Parse Classification"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "51178cac-ac0e-4b60-842b-4cd84fff76e9",
+              "leftValue": "={{ $json.confidence }}",
+              "rightValue": 0.7,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1296,
+        0
+      ],
+      "id": "4b74153f-6926-42c5-8abc-9dc268811f89",
+      "name": "Confidence Check"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.category === 'INTERESTED' || $json.category === 'QUESTION' }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    },
+                    "id": "c19717ac-14f5-4b8d-8c9d-289da5b5eb66"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "558c4007-f5a0-4360-98e8-905a9b52900e",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "NOT_NOW",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "f637c90b-440b-419a-b718-a036dd066eb8",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "NOT_INTERESTED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "baa8f4f5-0c53-43da-9f69-750e08907f24",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "UNSUBSCRIBE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a670e5af-c372-4692-a58b-250273ca44a8",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "AUTO_REPLY",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1536,
+        -64
+      ],
+      "id": "00da8bc3-a974-4cd7-a7ee-e15f60446f89",
+      "name": "Route by Category"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET status = 'replied', replied_at = NOW() WHERE id = {{ $('Parse Classification').item.json.id }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2160,
+        -400
+      ],
+      "id": "2acfb847-29eb-4223-9e81-954c8d414685",
+      "name": "Mark as Replied",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET\n  status = 'dead',\n  next_touch_at = NOW() + INTERVAL '90 days'\nWHERE id = {{ $('Parse Classification').item.json.id }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1888,
+        -208
+      ],
+      "id": "aa68fe77-970a-4800-8867-f3adecba33e1",
+      "name": "Snooze 90 Days",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=🎯 Lead replied — needs a human response\n\n{{ $json.first_name }} ({{ $json.company }})\nContact: {{ $json.email }}\nCategory: {{ $json.category }}\nSummary: {{ $json.summary }}\n\nTheir message: \"{{ $json.reply_text }}\"",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1888,
+        -400
+      ],
+      "id": "4b25721c-a400-409c-b976-093d4572d1b1",
+      "name": "Notify — Human Response Needed",
+      "webhookId": "93f14c67-a893-4c74-ad91-ef677a630ca6",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET status = 'unsubscribed' WHERE id = {{ $('Parse Classification').item.json.id }};\n\nINSERT INTO suppression_list (email, reason)\nVALUES (\n  '{{ $('Parse Classification').item.json.email.replace(/'/g, \"''\") }}',\n  'Requested via reply, {{ $now.toFormat('yyyy-MM-dd') }}'\n)\nON CONFLICT (email) DO NOTHING;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1888,
+        160
+      ],
+      "id": "28d2f8db-c6d7-4483-a9b6-08c6f1c8ccad",
+      "name": "Mark as Unsubscribe",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET status = 'exhausted' WHERE id = {{ $('Parse Classification').item.json.id }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1888,
+        -16
+      ],
+      "id": "cf3d9de0-385a-40e4-8c1b-dfb47f32de17",
+      "name": "Mark as Exhausted",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1888,
+        352
+      ],
+      "id": "22590fda-19a8-4abb-9891-69a14b25ce7d",
+      "name": "No Operation, do nothing"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Email Trigger (IMAP)": {
+      "main": [
+        [
+          {
+            "node": "Extract Reply Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Matching Lead": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Reply Text": {
+      "main": [
+        [
+          {
+            "node": "Find Matching Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Parse Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Classification": {
+      "main": [
+        [
+          {
+            "node": "Confidence Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence Check": {
+      "main": [
+        [
+          {
+            "node": "Route by Category",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Category": {
+      "main": [
+        [
+          {
+            "node": "Notify — Human Response Needed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Snooze 90 Days",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark as Exhausted",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark as Unsubscribe",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify — Human Response Needed": {
+      "main": [
+        [
+          {
+            "node": "Mark as Replied",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "8cd57ee1-7e73-48da-b2b7-da1734d249bc",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "6d6MXg3SBmoc1MoC",
+  "tags": []
+}

@@ -1,0 +1,1041 @@
+{
+  "name": "AI Voice Receptionist for Missed Calls",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "voice-receptionist",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -32,
+        -128
+      ],
+      "id": "cdea3581-ac75-44b6-8eae-90fcfdc03ee2",
+      "name": "Webhook",
+      "webhookId": "5d4d80a2-9252-4f5b-9413-0cac5097c83b"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "66a8ca40-5091-4bae-9be4-e6c0e990b155",
+              "leftValue": "={{ $json.body.message.type }}",
+              "rightValue": "end-of-call-report",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        144,
+        -128
+      ],
+      "id": "cd39a7ba-d2b1-4bbf-8e5c-3b5b0787cd86",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "jsCode": "const m = $json.body.message;\nconst call = m.call || {};\nconst transcript = m.artifact?.transcript || m.transcript || \"\";\nconst start = m.startedAt || call.startedAt || call.createdAt;\nconst end = m.endedAt || call.endedAt;\n\nreturn [{ json: {\n  call_id: call.id,\n  caller_number: call.customer?.number || \"web-call\",\n  started_at: start,\n  duration_sec: Math.round(m.durationSeconds ?? (new Date(end) - new Date(start)) / 1000),\n  ended_reason: m.endedReason || \"\",\n  transcript,\n  recording_url: m.artifact?.recordingUrl || m.recordingUrl || \"\",\n  user_turns: (transcript.match(/^User:/gm) || []).length\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        368,
+        -144
+      ],
+      "id": "1b0ff086-2d38-46ef-9c8a-c5e1e9f1a175",
+      "name": "Normalize Call"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO calls (call_id, caller_number, started_at, duration_sec, ended_reason, transcript, recording_url)\nVALUES ($1, $2, $3::timestamptz, $4::int, $5, $6, $7)\nON CONFLICT (call_id) DO NOTHING\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [$json.call_id, $json.caller_number, $json.started_at, $json.duration_sec, $json.ended_reason, $json.transcript, $json.recording_url] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        -144
+      ],
+      "id": "d845d324-4a93-4fa3-aec1-203762d40a30",
+      "name": "Store Call",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "02329218-83e0-44cb-ac8f-74d4097bbd10",
+              "leftValue": "={{ $json.call_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        752,
+        -144
+      ],
+      "id": "f607bd70-426f-4628-abaf-2b9ff87f26c0",
+      "name": "New Call?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "44355785-ad51-4f6a-8f53-8b43ddbbbb95",
+              "leftValue": "={{ $('Normalize Call').first().json.user_turns >= 2 && $json.duration_sec >= 10 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        992,
+        -224
+      ],
+      "id": "68955384-7680-4789-a085-30cfd8c77028",
+      "name": "Real Conversation?"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "=You extract structured data from phone call transcripts for a plumbing company. The transcript is between \"AI\" (the receptionist) and \"User\" (the caller).\n\nRULES:\n- Use only what the caller actually said. Never guess a name, address, or time.\n- If something was not said, use null.\n- urgency: \"emergency\" = active flooding, burst pipe, sewage backup, gas smell, no water at all, or anyone in danger. \"high\" = a leak or fault that is getting worse or blocks daily use. \"normal\" = routine repair or quote request. \"low\" = general question.\n- wants_appointment is true only if the caller asked for a visit or agreed to book one.\n- callback_needed is true if the caller asked something the AI could not answer, asked for a person, sounded upset, or urgency is high or emergency.\n- summary: 1-2 plain sentences, under 40 words, what the owner needs to know before calling back.\n\nReturn ONLY valid JSON, no markdown fences:\n{\"caller_name\": \"...\", \"reason\": \"...\", \"urgency\": \"...\", \"wants_appointment\": true, \"callback_needed\": true, \"summary\": \"...\"}"
+            },
+            {
+              "content": "={{ $json.transcript }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1312,
+        -240
+      ],
+      "id": "c8550200-efcd-42a5-94b6-be4f5403a3fe",
+      "name": "Extract Data",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $('Store Call').first().json;\nconst raw = $json.output?.[0]?.content?.[0]?.text ?? $json.message?.content ?? $json.content ?? \"\";\nconst URGENCY = [\"emergency\", \"high\", \"normal\", \"low\"];\n\nlet p = null;\ntry {\n  p = typeof raw === \"string\"\n    ? JSON.parse(raw.replace(/```json|```/g, \"\").trim())\n    : raw;\n} catch (e) {}\n\nconst toBool = v => v === true || String(v).toLowerCase() === \"true\";\nif (p) {\n  p.urgency = String(p.urgency || \"\").toLowerCase();\n  p.wants_appointment = toBool(p.wants_appointment);\n  p.callback_needed = toBool(p.callback_needed) || [\"emergency\", \"high\"].includes(p.urgency);\n}\n\nconst checks = p ? {\n  urgencyOk:      URGENCY.includes(p.urgency),\n  reasonOk:       typeof p.reason === \"string\" && p.reason.length > 3,\n  summaryOk:      typeof p.summary === \"string\" && p.summary.length > 10 && p.summary.split(/\\s+/).length <= 60,\n  noPlaceholders: !/\\[.*?\\]|\\{\\{.*?\\}\\}|lorem/i.test(JSON.stringify(p))\n} : { parsed: false };\n\nconst failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);\nconst valid = failed.length === 0;\n\nreturn [{ json: {\n  ...src,\n  caller_name: valid ? p.caller_name : null,\n  reason: valid ? p.reason : \"extraction failed, read transcript\",\n  urgency: valid ? p.urgency : \"high\",\n  wants_appointment: valid ? p.wants_appointment : false,\n  callback_needed: valid ? p.callback_needed : true,\n  summary: valid ? p.summary : (src.transcript || \"\").slice(0, 300),\n  valid,\n  fail: failed.join(\",\")\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        -240
+      ],
+      "id": "1ececebe-a8c3-4f97-ab6b-0b1e29143bdd",
+      "name": "Validate Extraction"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH u AS (\n  UPDATE calls SET\n    caller_name = $2, reason = $3, urgency = $4,\n    wants_appointment = $5::boolean, callback_needed = $6::boolean,\n    summary = $7,\n    status = CASE WHEN $8::boolean THEN 'handled' ELSE 'needs_review' END\n  WHERE call_id = $1\n  RETURNING *\n)\nSELECT u.*, to_char(a.slot_start, 'FMDay FMHH12:MI AM') AS booked_slot\nFROM u LEFT JOIN appointments a ON a.call_id = u.call_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.call_id, $json.caller_name, $json.reason, $json.urgency, $json.wants_appointment, $json.callback_needed, $json.summary, $json.valid] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1792,
+        -240
+      ],
+      "id": "b1b74831-c018-4f79-b756-31e501b4a816",
+      "name": "Save Extraction",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.urgency }}",
+                    "rightValue": "emergency",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "875afec5-8345-4122-9250-72f8b6c9e4db"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "b3b32e48-c12f-4fd8-a830-ba9141e004c6",
+                    "leftValue": "={{ $json.callback_needed || $json.status === 'needs_review' || $json.urgency === 'high' }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1984,
+        -320
+      ],
+      "id": "b2f7db74-9324-45bd-80fe-c4824c43949f",
+      "name": "Route by Urgency"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=[EMERGENCY] {{ $json.caller_number }}\n{{ $json.caller_name || 'Unknown caller' }}: {{ $json.summary }} Call back now.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2256,
+        -336
+      ],
+      "id": "c1fb67ab-859f-460f-a88f-6b9ef4281724",
+      "name": "Alert Emergency",
+      "webhookId": "b4af56f9-0d0d-434f-ac33-831736797d08",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=[CALLBACK] {{ $json.caller_number }} ({{ $json.urgency }})\n{{ $json.caller_name || 'Unknown caller' }}: {{ $json.summary }}\n{{ $json.booked_slot ? 'Booked: ' + $json.booked_slot : 'Not booked' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2256,
+        -192
+      ],
+      "id": "98d73182-43e2-4410-babf-6cb9c686aa5d",
+      "name": "Alert Callback",
+      "webhookId": "b4af56f9-0d0d-434f-ac33-831736797d08",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "67bcce3f-1e09-48ab-ab97-c06124bd5632",
+              "leftValue": "={{ $json.booked_slot }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1984,
+        -112
+      ],
+      "id": "15029d5d-7930-4cbc-8091-16402c0918d2",
+      "name": "Booked?"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=SMS to {{ $json.caller_number }}: You're booked for {{ $json.booked_slot }} with Reyes Plumbing. Reply here if anything changes.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2256,
+        -32
+      ],
+      "id": "345dfd46-451a-45a5-920a-a4118670e8d2",
+      "name": "SMS Booking Confirmation",
+      "webhookId": "e6411b18-9fa8-4da9-a70b-d65090cc1725",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT $1::text AS number\nWHERE $1::text <> 'web-call'\n  AND NOT EXISTS (SELECT 1 FROM suppression WHERE number = $1::text)\n  AND NOT EXISTS (\n    SELECT 1 FROM calls\n    WHERE caller_number = $1::text\n      AND followup_sent_at > NOW() - INTERVAL '30 minutes'\n  );",
+        "options": {
+          "queryReplacement": "={{ [$json.caller_number] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1168,
+        -160
+      ],
+      "id": "c7df35fc-d9cb-45a9-8a90-a3012ce3c2f5",
+      "name": "Can We Text?",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=SMS to {{ $json.number }}: Sorry we missed your call to Reyes Plumbing. Reply with what you need and we'll get back to you within 15 minutes.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1344,
+        -64
+      ],
+      "id": "65ad0eb4-2a5d-47ed-a2b6-f3163a82eb1b",
+      "name": "SMS Text-Back",
+      "webhookId": "e6411b18-9fa8-4da9-a70b-d65090cc1725",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE calls SET status = 'hung_up', followup_sent_at = NOW() WHERE call_id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Store Call').first().json.call_id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1552,
+        -64
+      ],
+      "id": "bd514b43-8a2d-45de-8d64-e62e2b9b28f6",
+      "name": "Mark Hung Up",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "### Post-Call Processing\nTurns every call into a saved record, an urgency rating, and the right alert.",
+        "height": 560,
+        "width": 2544,
+        "color": "#8C431D"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -96,
+        -384
+      ],
+      "id": "e755d37a-8b94-42bb-9a73-e8904adddb39",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $json.body.message;\nconst tc = msg.toolCallList?.[0] || msg.toolCalls?.[0];\nconst raw = tc.function?.arguments ?? tc.arguments ?? {};\nconst args = typeof raw === \"string\" ? JSON.parse(raw) : raw;\nreturn [{ json: { toolCallId: tc.id, date: args.date } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        320
+      ],
+      "id": "939fe9a1-68e0-478c-9695-959dff29405f",
+      "name": "Parse Availability Call"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT to_char(s, 'HH24:MI') AS slot\nFROM generate_series($1::date + time '09:00', $1::date + time '16:30', interval '30 minutes') AS s\nWHERE EXTRACT(ISODOW FROM $1::date) < 6\n  AND s > (NOW() AT TIME ZONE 'Asia/Manila')\n  AND NOT EXISTS (\n    SELECT 1 FROM appointments a WHERE a.slot_start = s AND a.status = 'booked'\n  )\nORDER BY s\nLIMIT 3;",
+        "options": {
+          "queryReplacement": "={{ [$json.date] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        416,
+        320
+      ],
+      "id": "14c65b9c-d9ee-464d-86c2-4a061ec0d92f",
+      "name": "Get Open Slots",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const { toolCallId, date } = $('Parse Availability Call').first().json;\nconst slots = $input.all().map(i => i.json.slot).filter(Boolean);\nconst result = slots.length\n  ? `Open times on ${date}: ${slots.join(\", \")}. Offer these to the caller.`\n  : `No openings on ${date}. Ask the caller for a different weekday.`;\nreturn [{ json: { results: [{ toolCallId, result }] } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        320
+      ],
+      "id": "53baefce-ed17-4307-9f9f-37ca1a0563ec",
+      "name": "Build Response"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        864,
+        320
+      ],
+      "id": "bf707349-8b20-4f07-9870-554313244667",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "book-appointment",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -48,
+        672
+      ],
+      "id": "48cbf046-e343-4008-a379-426d04b0ef2a",
+      "name": "Webhook Book",
+      "webhookId": "975f6163-c24e-41b7-b34c-668d4b58d0cc"
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $json.body.message;\nconst tc = msg.toolCallList?.[0] || msg.toolCalls?.[0];\nconst raw = tc.function?.arguments ?? tc.arguments ?? {};\nconst a = typeof raw === \"string\" ? JSON.parse(raw) : raw;\nreturn [{ json: {\n  toolCallId: tc.id,\n  date_time: a.date_time,\n  caller_name: a.caller_name || null,\n  reason: a.reason || null,\n  caller_number: msg.call?.customer?.number || \"web-call\",\n  call_id: msg.call?.id || $json.headers?.[\"x-call-id\"]\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        672
+      ],
+      "id": "f259864a-c663-4ea5-9fc1-35cb6129e27e",
+      "name": "Parse Booking Call"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO appointments (slot_start, caller_name, caller_number, reason, call_id)\nSELECT s, $2::text, $3::text, $4::text, $5::text\nFROM (SELECT $1::timestamp AS s) t\nWHERE s::time BETWEEN '09:00' AND '16:30'\n  AND EXTRACT(ISODOW FROM s) < 6\n  AND EXTRACT(MINUTE FROM s) IN (0, 30)\n  AND s > (NOW() AT TIME ZONE 'Asia/Manila')\nON CONFLICT (slot_start) DO NOTHING\nRETURNING to_char(slot_start, 'FMDay FMHH12:MI AM') AS booked;",
+        "options": {
+          "queryReplacement": "={{ [$json.date_time, $json.caller_name, $json.caller_number, $json.reason, $json.call_id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        416,
+        672
+      ],
+      "id": "731a0339-a3ce-40bd-bf13-546161297d71",
+      "name": "Insert Slot",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a5cc1c1c-4c13-4a3e-b89c-9c5c70c60557",
+              "leftValue": "={{ $json.booked }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        640,
+        672
+      ],
+      "id": "d9c8d9aa-d8ba-4c47-84e3-3830d22668bc",
+      "name": "Slot Booked?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { results: [{ toolCallId: $('Parse Booking Call').first().json.toolCallId, result: \"Booked for \" + $json.booked + \". Read the day and time back to the caller.\" }] } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        864,
+        576
+      ],
+      "id": "d4c72f9d-6690-4a41-bb25-133746a3a29b",
+      "name": "Respond Booked"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { results: [{ toolCallId: $('Parse Booking Call').first().json.toolCallId, result: \"That time is not available. Call check_availability again and offer the caller other times.\" }] } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        864,
+        768
+      ],
+      "id": "a14efe98-53cf-415c-90fc-7a597b9f5478",
+      "name": "Respond Not Available"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=[NEW BOOKING] {{ $('Insert Slot').first().json.booked }}\n{{ $('Parse Booking Call').first().json.caller_name || 'Unknown' }} ({{ $('Parse Booking Call').first().json.caller_number }}): {{ $('Parse Booking Call').first().json.reason }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1056,
+        576
+      ],
+      "id": "e0cdb22f-d046-4be3-8835-622cf19b8f32",
+      "name": "Alert New Booking",
+      "webhookId": "251c22b1-b42f-4975-a008-7279c265f979",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "### Live Availability Check\nGives the AI only the time slots that are actually open, mid-call.",
+        "height": 272,
+        "width": 1168,
+        "color": "#3B2C87"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -96,
+        224
+      ],
+      "id": "294ac286-674b-4b57-ad17-7b28f051f58f",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "### Live Booking\nBooks the slot, or refuses it if someone already took it.",
+        "height": 384,
+        "width": 1360,
+        "color": "#05662A"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -96,
+        544
+      ],
+      "id": "a8de559d-7604-421b-a5d8-f0331a7eb035",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "check-availability",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -32,
+        320
+      ],
+      "id": "206f9aeb-0989-4392-8e64-ea1f0a6aebc6",
+      "name": "Webhook Availability",
+      "webhookId": "1a682fe6-b3b1-4075-b7d8-dd1530130afd"
+    },
+    {
+      "parameters": {
+        "content": "## Legend\n\n🟧 **Post-Call Processing**: runs after the call ends\n\n🟦 **Live Availability Check**: runs during the call\n\n🟩 **Live Booking**: runs during the call\n",
+        "height": 192,
+        "width": 528,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1456,
+        384
+      ],
+      "id": "b1b06a0c-10d3-4d40-b8f6-7b17adc75612",
+      "name": "Sticky Note3"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Normalize Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Call": {
+      "main": [
+        [
+          {
+            "node": "Store Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Call": {
+      "main": [
+        [
+          {
+            "node": "New Call?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Call?": {
+      "main": [
+        [
+          {
+            "node": "Real Conversation?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Real Conversation?": {
+      "main": [
+        [
+          {
+            "node": "Extract Data",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Can We Text?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Data": {
+      "main": [
+        [
+          {
+            "node": "Validate Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Extraction": {
+      "main": [
+        [
+          {
+            "node": "Save Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Extraction": {
+      "main": [
+        [
+          {
+            "node": "Route by Urgency",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Booked?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Urgency": {
+      "main": [
+        [
+          {
+            "node": "Alert Emergency",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Booked?": {
+      "main": [
+        [
+          {
+            "node": "SMS Booking Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Can We Text?": {
+      "main": [
+        [
+          {
+            "node": "SMS Text-Back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SMS Text-Back": {
+      "main": [
+        [
+          {
+            "node": "Mark Hung Up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Availability Call": {
+      "main": [
+        [
+          {
+            "node": "Get Open Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Open Slots": {
+      "main": [
+        [
+          {
+            "node": "Build Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Book": {
+      "main": [
+        [
+          {
+            "node": "Parse Booking Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Booking Call": {
+      "main": [
+        [
+          {
+            "node": "Insert Slot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Slot": {
+      "main": [
+        [
+          {
+            "node": "Slot Booked?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot Booked?": {
+      "main": [
+        [
+          {
+            "node": "Respond Booked",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Not Available",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Booked": {
+      "main": [
+        [
+          {
+            "node": "Alert New Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Availability": {
+      "main": [
+        [
+          {
+            "node": "Parse Availability Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "67588ad0-d216-47c4-b4de-b4ad300f2031",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "Ik93re8qPnInElEU",
+  "tags": []
+}

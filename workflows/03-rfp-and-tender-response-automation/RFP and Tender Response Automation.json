@@ -1,0 +1,1406 @@
+{
+  "name": "RFP and Tender Response Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "RFP Intake",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "RFP title",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "RFP file",
+              "fieldType": "file",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Override",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Yes"
+                  },
+                  {
+                    "option": "No"
+                  }
+                ]
+              },
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        32,
+        0
+      ],
+      "id": "01f26a7e-7b10-4771-a2c5-53d7eb645a01",
+      "name": "RFP Intake",
+      "webhookId": "0fac628f-9024-4169-8546-5ad641429292"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "RFP_file",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        208,
+        0
+      ],
+      "id": "13da0a4c-7488-4ff3-881a-bec0c54fed1a",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = ($json.text || '').replace(/\\r/g, '');\nif (raw.trim().length < 500) {\n  throw new Error('No extractable text. Scanned PDF? OCR it first.');\n}\n\nconst form = $('RFP Intake').first().json;\nconst text = raw.replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();\n\nconst windows = [];\nlet cur = [], count = 0;\nfor (const line of text.split('\\n')) {\n  const w = line.split(/\\s+/).filter(Boolean).length;\n  if (count + w > 900 && cur.length) {\n    windows.push(cur.join('\\n'));\n    cur = cur.slice(-8);\n    count = cur.join(' ').split(/\\s+/).length;\n  }\n  cur.push(line);\n  count += w;\n}\nif (cur.length) windows.push(cur.join('\\n'));\n\nreturn [{ json: {\n  title: form['RFP title'] || 'Untitled RFP',\n  override: form['Override'] === 'Yes',\n  head: windows.slice(0, 2).join('\\n'),\n  windows,\n  full_text: text\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        384,
+        0
+      ],
+      "id": "733d3f92-f3c2-49a5-9384-e15f8d262f81",
+      "name": "Clean and window"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO rfps (title, raw_text) VALUES ($1, $2) RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [$json.title, $json.full_text] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        576,
+        0
+      ],
+      "id": "97a5ed73-cfdb-4519-85bb-6b92ac3477a2",
+      "name": "Save RFP",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You extract facts from the start of an RFP. You never guess.\nIf a field is not stated in the text, use null.\n\nReturn ONLY valid JSON, no markdown fences:\n{\n  \"issuer\": \"string or null\",\n  \"deadline\": \"YYYY-MM-DD or null\",\n  \"contract_value\": \"number or null\",\n  \"currency\": \"USD, PHP, GBP... or null\",\n  \"region\": \"string or null\",\n  \"mandatory_certifications\": [\"string\"],\n  \"required_experience_years\": \"number or null\",\n  \"scope_summary\": \"under 30 words\"\n}"
+            },
+            {
+              "content": "=RFP excerpt:\n{{ $('Clean and window').first().json.head }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        752,
+        0
+      ],
+      "id": "a4b9e5c0-616a-4b33-9abb-dce37291af8f",
+      "name": "Extract metadata",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const PROFILE = {\n  regions: ['philippines', 'united kingdom', 'uk', 'remote'],\n  currency: 'USD',\n  min_value: 5000,\n  max_value: 250000,\n  certifications: ['27001'],   // one keyword per cert you actually hold\n  max_years: 5,\n  min_days: 7,\n  bid_threshold: 55\n};\n\nconst ctx = $('Clean and window').first().json;\nconst rfpId = $('Save RFP').first().json.id;\n\nconst msg = ($json.output || []).find(o => o.type === 'message');\nconst raw = msg?.content?.[0]?.text ?? $json.message?.content ?? $json.content ?? '';\n\nlet m = null;\ntry {\n  m = typeof raw === 'string' ? JSON.parse(raw.replace(/```json|```/g, '').trim()) : raw;\n} catch (e) {}\n\nlet score = 50;\nconst reasons = [];\nif (!m) { m = {}; reasons.push('metadata unparseable, score is a guess'); }\n\nconst d = m.deadline ? new Date(m.deadline) : null;\nconst validDate = d && !isNaN(d);\nif (validDate) {\n  const days = Math.ceil((d - Date.now()) / 86400000);\n  if (days < 0)                     { score -= 100; reasons.push('deadline already passed'); }\n  else if (days < PROFILE.min_days) { score -= 25;  reasons.push(`only ${days} days left`); }\n  else                              { score += 10;  reasons.push(`${days} days to deadline`); }\n} else {\n  reasons.push('deadline not found, check manually');\n}\n\nif (m.region) {\n  const ok = PROFILE.regions.some(r => m.region.toLowerCase().includes(r));\n  score += ok ? 15 : -25;\n  reasons.push(ok ? 'region match' : `region outside coverage (${m.region})`);\n}\n\nif (m.contract_value && m.currency === PROFILE.currency) {\n  const ok = m.contract_value >= PROFILE.min_value && m.contract_value <= PROFILE.max_value;\n  score += ok ? 15 : -20;\n  reasons.push(ok ? 'value in target range' : `value out of range (${m.contract_value})`);\n}\n\nconst missing = (m.mandatory_certifications || [])\n  .filter(c => !PROFILE.certifications.some(h => String(c).toLowerCase().includes(h)));\nif (missing.length) { score -= 30; reasons.push('missing mandatory certs: ' + missing.join(', ')); }\n\nif (m.required_experience_years > PROFILE.max_years) {\n  score -= 10; reasons.push(`asks for ${m.required_experience_years} yrs experience`);\n}\n\nscore = Math.max(0, Math.min(100, score));\nconst bid = score >= PROFILE.bid_threshold || ctx.override;\n\nreturn [{ json: {\n  rfp_id: rfpId,\n  title: ctx.title,\n  issuer: m.issuer ?? null,\n  deadline: validDate ? String(m.deadline).slice(0, 10) : null,\n  score,\n  reasons: reasons.join('; '),\n  bid,\n  windows: ctx.windows\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        0
+      ],
+      "id": "835476bd-4b69-43ec-a5f9-78db615cbe89",
+      "name": "Score bid"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE rfps SET\n  issuer = $2,\n  deadline = $3::timestamp,\n  bid_score = $4,\n  bid_reasons = $5,\n  status = CASE WHEN $6::boolean THEN 'drafting' ELSE 'no_bid' END\nWHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.rfp_id, $json.issuer, $json.deadline, $json.score, $json.reasons, $json.bid] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1216,
+        0
+      ],
+      "id": "41455bfb-d131-4df1-aec3-e6bb52252838",
+      "name": "Update RFP",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "089501e8-a1c9-437e-b5e2-db23893efe4a",
+              "leftValue": "={{ $('Score bid').first().json.bid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1392,
+        0
+      ],
+      "id": "cb438622-4cc5-480e-855c-cf68cc5e91c0",
+      "name": "Bid?"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=NO BID recommended: {{ $('Score bid').first().json.title }}\nScore: {{ $('Score bid').first().json.score }}/100\nReasons: {{ $('Score bid').first().json.reasons }}\nResubmit the form with Override = Yes to bid anyway.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1616,
+        64
+      ],
+      "id": "4d4fe3ad-995a-497b-b3e6-fba371260cb5",
+      "name": "No-bid alert",
+      "webhookId": "06092284-8502-448a-97aa-a838b650f854",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $('Score bid').first().json;\nreturn s.windows.map((text, i) => ({ json: { rfp_id: s.rfp_id, window_no: i, text } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        -96
+      ],
+      "id": "7dd3d4aa-6968-44ce-b744-7a34febf3a44",
+      "name": "Split windows"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1888,
+        0
+      ],
+      "id": "f9f86d72-3aac-4104-9e7b-0ca10e8b5359",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You extract the requirements a bidder must respond to from an RFP excerpt.\n\nAn item counts if it asks the bidder to describe, confirm, state, provide, or demonstrate something.\nIgnore background, definitions, evaluation criteria, and submission instructions.\n\nCOMPLETENESS RULES (important):\n- Every numbered questionnaire item (for example 1.1, 2.1, 3.2, 5.3) is a separate requirement.\n- Return ALL of them, in order, whether or not they use the word \"must\".\n- Do not skip items. Do not merge items. Do not summarize.\n\nFor each item return:\n- q_number: the number exactly as printed (e.g. \"3.2\"), or null\n- question: the requirement as one clear question or statement, using only words from the text\n- mandatory: true only if the item says must, shall, required, mandatory, or is marked pass/fail. Otherwise false\n- category: one of COMPANY, TECHNICAL, SECURITY, PRICING, EXPERIENCE, COMPLIANCE, LEGAL, OTHER\n\nNever invent items. If the excerpt has none, return an empty list.\n\nReturn ONLY valid JSON, no markdown fences:\n{\"items\":[{\"q_number\":\"\",\"question\":\"\",\"mandatory\":true,\"category\":\"\"}]}"
+            },
+            {
+              "content": "=RFP excerpt (part {{ $json.window_no + 1 }}):\n{{ $json.text }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        2080,
+        80
+      ],
+      "id": "792ffdb9-b2d0-4041-9cf9-f7f0e5800106",
+      "name": "Extract requirements",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = ($json.output || []).find(o => o.type === 'message');\nconst raw = msg?.content?.[0]?.text ?? $json.message?.content ?? $json.content ?? '';\nconst clean = String(raw).replace(/```json|```/g, '').trim();\n\nconst KEYS = 'items|q_number|question|mandatory|category';\nconst repair = s => s\n  .replace(/[\\u0000-\\u001F]+/g, ' ')                                    // raw line breaks\n  .replace(new RegExp('([{,]\\\\s*)(' + KEYS + ')\\\\s*:', 'g'), '$1\"$2\":') // unquoted keys\n  .replace(/,\\s*([}\\]])/g, '$1');                                        // trailing commas\n\nconst tryParse = s => { try { return JSON.parse(s); } catch (e) { return null; } };\n\nconst p = tryParse(clean) || tryParse(repair(clean));\nlet items = Array.isArray(p?.items) ? p.items : [];\nlet salvaged = false;\n\nif (!items.length) {\n  // last resort: parse each {...} object on its own\n  for (const o of (clean.match(/\\{[^{}]*\\}/g) || [])) {\n    const q = tryParse(o) || tryParse(repair(o));\n    if (q && q.question) items.push(q);\n  }\n  salvaged = items.length > 0;\n}\n\nreturn [{ json: {\n  items,\n  count: items.length,\n  salvaged,\n  parse_failed: items.length === 0,\n  q_numbers: items.map(i => i.q_number).join(', '),\n  raw_preview: items.length ? '' : clean.slice(0, 400)\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        80
+      ],
+      "id": "d516d0b4-3d91-4560-a6ca-c3901afe5a3f",
+      "name": "Parse window"
+    },
+    {
+      "parameters": {
+        "jsCode": "const rfpId = $('Score bid').first().json.rfp_id;\nconst CATS = ['COMPANY','TECHNICAL','SECURITY','PRICING','EXPERIENCE','COMPLIANCE','LEGAL','OTHER'];\nconst seen = new Set();\nconst out = [];\n\nfor (const it of $input.all()) {\n  for (const q of it.json.items || []) {\n    const text = (q.question || '').trim();\n    if (text.length < 15) continue;\n    const key = q.q_number ? 'n:' + q.q_number : 't:' + text.toLowerCase().slice(0, 60);\n    if (seen.has(key)) continue;\n    seen.add(key);\n    out.push({ json: {\n      rfp_id: rfpId,\n      q_number: q.q_number ?? null,\n      question: text,\n      mandatory: q.mandatory === true,\n      category: CATS.includes(q.category) ? q.category : 'OTHER'\n    }});\n  }\n}\n\nif (out.length === 0) throw new Error('No requirements extracted. Check the PDF text and the extraction prompt.');\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        -96
+      ],
+      "id": "53b4f87f-ef89-4ef5-a962-c47bad4bba0d",
+      "name": "Dedupe questions"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO rfp_questions (rfp_id, q_number, question, mandatory, category)\nVALUES ($1, $2, $3, $4, $5);",
+        "options": {
+          "queryReplacement": "={{ [$json.rfp_id, $json.q_number, $json.question, $json.mandatory, $json.category] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2272,
+        -96
+      ],
+      "id": "ca79da85-cd01-4f06-8d3a-4472c10f861e",
+      "name": "Save questions",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "8Rilvmd0VjFUDbhV",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/8Rilvmd0VjFUDbhV",
+          "cachedResultName": "RFP Response Engine (B) Answers"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "rfp_id": "={{ $('Score bid').first().json.rfp_id }}"
+          },
+          "matchingColumns": [
+            "rfp_id"
+          ],
+          "schema": [
+            {
+              "id": "rfp_id",
+              "displayName": "rfp_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "number",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        2464,
+        -96
+      ],
+      "id": "cc5bff44-d2d8-4390-a35c-5474d63fc60f",
+      "name": "Run answer engine",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "content": "## 1. Intake and bid/no-bid\nUpload the RFP PDF, extract deadline, budget and certs, score bid or no-bid, then extract every requirement.",
+        "height": 592,
+        "width": 2704,
+        "color": "#8C431D"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -240
+      ],
+      "id": "2602fb95-620e-44e6-a2fa-73a45a55c2ed",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "inputSource": "jsonExample",
+        "jsonExample": "{ \"rfp_id\": 4 }"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        32,
+        688
+      ],
+      "id": "3a3024ae-ab94-46cc-a76c-309ccb6e3f7d",
+      "name": "Start"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, rfp_id, q_number, question, mandatory, category\nFROM rfp_questions\nWHERE rfp_id = $1 AND status = 'pending'\nORDER BY mandatory DESC, id;",
+        "options": {
+          "queryReplacement": "={{ [$json.rfp_id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        320,
+        688
+      ],
+      "id": "572b9a44-d6d4-4cbb-a6ca-054d16665d70",
+      "name": "Get pending",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:1234/v1/embeddings",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: \"text-embedding-nomic-embed-text-v1.5\", input: \"search_query: \" + $json.question } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        656,
+        768
+      ],
+      "id": "0dac560b-f283-4386-8399-318a62a2691b",
+      "name": "Embed question"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, source, section, LEFT(content, 60) AS preview, content,\n       ROUND((1 - (embedding <=> $1::vector))::numeric, 3) AS similarity\nFROM library_chunks\nWHERE approved = TRUE\nORDER BY embedding <=> $1::vector\nLIMIT 4;",
+        "options": {
+          "queryReplacement": "={{ ['[' + $json.data[0].embedding.join(',') + ']'] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        864,
+        768
+      ],
+      "id": "c1cf9ed7-5264-41ba-9a2f-0ab0048887b4",
+      "name": "Search library",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const THRESHOLD = 0.60;   // we will calibrate this with the trap questions\nconst q = $('Loop Over Items1').first().json;\n\nconst rows = $input.all().map(i => i.json).filter(r => r.id);\nconst top = rows.length ? Number(rows[0].similarity) : 0;\nconst usable = rows.filter(r => Number(r.similarity) >= THRESHOLD);\n\nconst context = usable\n  .map(r => `[SOURCE ${r.id}] (${r.source} / ${r.section})\\n${r.content}`)\n  .join('\\n\\n');\n\nreturn [{ json: {\n  ...q,\n  top_similarity: top,\n  has_evidence: usable.length > 0,\n  source_ids: usable.map(r => Number(r.id)),\n  sims: rows.map(r => `${r.source}: ${r.similarity}`).join(' | '),\n  context\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1072,
+        768
+      ],
+      "id": "0dd55563-1d3e-4b84-9c91-3f382ebfa5ae",
+      "name": "Build context"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "90025814-bc92-4d69-8c7f-0ae6da3e7d0c",
+              "leftValue": "={{ $json.has_evidence }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1264,
+        768
+      ],
+      "id": "2fac3da6-5aa9-4eda-8f56-12dda75d1a93",
+      "name": "Has evidence?"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a bid writer answering ONE RFP question using ONLY the approved source material provided.\n\nRULES:\n- Use only facts stated in the SOURCES. Never add numbers, dates, certifications, client names, prices, or claims that are not in them.\n- Describe each project exactly as the source describes it. Never relabel a project as a different kind of system.\n- Never claim experience in a region, industry, or technology that the SOURCES do not state.\n- If the question asks for a specific region, industry, or type of experience that the SOURCES do not show, say plainly what we do not have, describe only what is stated, and set \"complete\" to false.\n- If the sources only partly answer the question, answer just the supported part and set \"complete\" to false.\n- If the sources do not answer it at all, return {\"answer\":\"INSUFFICIENT_EVIDENCE\",\"used_sources\":[],\"complete\":false}.\n- The value of \"answer\" must be plain prose sentences. Never put JSON, key-value pairs, or lists of fields inside it. If the question asks for several details, write them as sentences.\n- Write in first person plural (\"we\"), plain professional tone, 60-180 words.\n- Answer only what was asked. Do not add unrelated security, uptime, or support details.\n- No bullet points unless the question asks for a list. No marketing filler.\n- Never write SOURCE tags or numbers inside the answer text.\n- used_sources must contain ONLY the numbers that appear after the word SOURCE in the material you were given, for the sources you actually used.\n\nReturn ONLY valid JSON with double-quoted keys, no markdown fences:\n{\"answer\":\"...\",\"used_sources\":[...],\"complete\":true}"
+            },
+            {
+              "content": "=RFP question {{ $json.q_number }} (category: {{ $json.category }}):\n{{ $json.question }}\n\nSOURCES:\n{{ $json.context }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1440,
+        704
+      ],
+      "id": "f11899f3-2212-4f38-a6b2-5e2568d8766f",
+      "name": "Draft answer",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $('Build context').first().json;\nconst msg = ($json.output || []).find(o => o.type === 'message');\nconst raw = msg?.content?.[0]?.text ?? $json.message?.content ?? $json.content ?? '';\nconst clean = String(raw).replace(/```json|```/g, '').trim();\n\nconst KEYS = 'answer|used_sources|complete';\nconst repair = s => s\n  .replace(/[\\u0000-\\u001F]+/g, ' ')\n  .replace(new RegExp('([{,]\\\\s*)(' + KEYS + ')\\\\s*:', 'g'), '$1\"$2\":')\n  .replace(/,\\s*([}\\]])/g, '$1');\nconst tryParse = s => { try { return JSON.parse(s); } catch (e) { return null; } };\n\nconst p = tryParse(clean) || tryParse(repair(clean));\nif (!p) {\n  return [{ json: { ...src, draft_answer: clean.slice(0, 1500), used_sources: [], status: 'needs_human', fail: 'unparseable' } }];\n}\n\n// if the model returned an object instead of text, keep it visible as text so it fails the prose check\nconst rawAnswer = typeof p.answer === 'string' ? p.answer : JSON.stringify(p.answer ?? '');\n\n// strip inline \"(SOURCE 3)\" tags the model sometimes leaves in the text\nconst answer = rawAnswer\n  .replace(/\\s*\\(?\\s*SOURCES?\\s*\\d+(\\s*,\\s*\\d+)*\\s*\\)?/gi, '')\n  .replace(/\\s+([.,])/g, '$1')\n  .trim();\n\nif (answer === 'INSUFFICIENT_EVIDENCE') {\n  return [{ json: { ...src, draft_answer: '', used_sources: [], status: 'needs_human', fail: 'model_found_no_evidence' } }];\n}\n\nconst words = answer.split(/\\s+/).length;\nconst ctxLower = src.context.toLowerCase();\nconst ctxNoCommas = src.context.replace(/(\\d),(?=\\d)/g, '$1');\n\n// 1) every number, year, or percentage must exist in the sources\n//    (commas ignored, and \"item 2.1\" style references skipped)\nconst answerForNums = answer.replace(/\\b(?:items?|questions?|sections?|requirements?)\\s+\\d+(?:\\.\\d+)*/gi, '');\nconst nums = (answerForNums.match(/\\d[\\d,.]*%?/g) || [])\n  .map(n => n.replace(/[.,]+$/, '').replace(/(\\d),(?=\\d)/g, '$1'))\n  .filter(n => n.length >= 2);\nconst ungrounded = nums.filter(n => !ctxNoCommas.includes(n));\n\n// 2) every capitalised word in the middle of a sentence must exist in the sources\nconst IGNORE = new Set(['We', 'Our', 'The', 'This', 'These', 'Their', 'It', 'Its',\n                        'Kestrel', 'Digital', 'Solutions', 'Inc']);   // your own company name\nconst names = new Set();\nfor (const s of answer.split(/(?<=[.!?])\\s+/)) {\n  for (const t of s.trim().split(/\\s+/).slice(1)) {\n    const w = t.replace(/^[^A-Za-z]+|[^A-Za-z0-9]+$/g, '');\n    if (/^[A-Z][A-Za-z0-9]+$/.test(w) && !IGNORE.has(w)) names.add(w);\n  }\n}\nconst unknownNames = [...names].filter(w => !ctxLower.includes(w.toLowerCase()));\n\nconst used = Array.isArray(p.used_sources) ? p.used_sources.map(Number) : [];\nconst ph = answer.match(/\\[.*?\\]|\\{\\{.*?\\}\\}|XYZ|Lorem|TBD/i);\n\nconst checks = {\n  hasAnswer:       answer.length > 40,\n  isProse:         !/^\\s*[\\[{]/.test(answer) && !/\"[A-Za-z_ ]+\"\\s*:/.test(answer),\n  lengthOk:        words >= 25 && words <= 250,\n  numbersGrounded: ungrounded.length === 0,\n  namesGrounded:   unknownNames.length === 0,\n  citesValid:      used.length > 0 && used.every(id => src.source_ids.includes(id)),\n  noPlaceholders:  !ph,\n  noAiTells:       !/as an AI|the provided sources|based on the sources/i.test(answer)\n};\nconst failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);\n\nreturn [{ json: {\n  ...src,\n  draft_answer: answer,\n  used_sources: used,\n  status: failed.length ? 'needs_human' : (p.complete === false ? 'partial' : 'drafted'),\n  fail: failed.join(',')\n    + (ph ? ` <${ph[0]}>` : '')\n    + (ungrounded.length ? ` [${ungrounded.join(' ')}]` : '')\n    + (unknownNames.length ? ` {${unknownNames.join(' ')}}` : '')\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        704
+      ],
+      "id": "2761b5da-0514-4832-8f49-9c751d9a0a25",
+      "name": "Guardrail"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE rfp_questions SET\n  draft_answer = $2,\n  sources = $3,\n  top_similarity = $4,\n  status = $5,\n  fail = $6\nWHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.draft_answer, ($json.used_sources || []).join(','), $json.top_similarity, $json.status, $json.fail] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1792,
+        864
+      ],
+      "id": "aec364bc-54ba-4ac6-afc2-c08ecd4aa508",
+      "name": "Save draft",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "84f1ba7d-fa9d-4e83-b47c-a54bfdc1d92c",
+              "name": "status",
+              "value": "needs_human",
+              "type": "string"
+            },
+            {
+              "id": "10ba3d3c-ecb3-404d-b802-a68160babcc5",
+              "name": "fail",
+              "value": "no_evidence",
+              "type": "string"
+            },
+            {
+              "id": "aeaa889f-425b-4566-a4c6-546bb26a31f4",
+              "name": "draft_answer",
+              "value": "",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        1456,
+        896
+      ],
+      "id": "29bac7fe-0749-4e5c-abd0-515008fdc4d5",
+      "name": "No evidence"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT r.title, r.deadline, q.q_number, q.category, q.mandatory, q.question,\n       q.draft_answer, q.status, q.fail, q.top_similarity, q.sources\nFROM rfp_questions q JOIN rfps r ON r.id = q.rfp_id\nWHERE q.rfp_id = $1\nORDER BY q.id;",
+        "options": {
+          "queryReplacement": "={{ [$('Start').first().json.rfp_id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        656,
+        544
+      ],
+      "id": "9a971c8e-628b-49f6-a94c-e1774dbaedd7",
+      "name": "Get all questions",
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst esc = v => `\"${String(v ?? '').replace(/\"/g, '\"\"').replace(/\\r?\\n/g, ' ')}\"`;\n\nconst header = ['Ref','Category','Mandatory','Requirement','Status','Similarity','Sources','Draft answer','Flag'];\nconst lines = rows.map(r => [\n  r.q_number,\n  r.category,\n  r.mandatory ? 'YES' : 'no',\n  r.question,\n  r.status,\n  r.top_similarity ?? '',\n  r.sources ?? '',\n  r.draft_answer ?? '',\n  r.fail ?? ''\n].map(esc).join(','));\n\nconst open = rows.filter(r => r.mandatory && r.status !== 'drafted');\nconst dl = rows[0]?.deadline ? String(rows[0].deadline).slice(0, 10) : 'not found';\n\nreturn [{ json: {\n  title: rows[0]?.title,\n  deadline: dl,\n  total: rows.length,\n  drafted: rows.filter(r => r.status === 'drafted').length,\n  partial: rows.filter(r => r.status === 'partial').length,\n  human: rows.filter(r => r.status === 'needs_human').length,\n  mandatory_open: open.length,\n  mandatory_open_refs: open.map(r => r.q_number || '?').join(', '),\n  csv: '\\uFEFF' + [header.join(','), ...lines].join('\\n')\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        864,
+        544
+      ],
+      "id": "8477c8ec-b689-46f3-a2f8-88988eb63ea1",
+      "name": "Build matrix"
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "csv",
+        "options": {
+          "fileName": "compliance_matrix.csv"
+        }
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        1072,
+        544
+      ],
+      "id": "cdc96a03-3582-475f-ba64-edd71ba85ec0",
+      "name": "Matrix file"
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "5611798761",
+        "binaryData": true,
+        "additionalFields": {
+          "caption": "={{ [\n  'RFP ready for review: ' + $('Build matrix').first().json.title,\n  'Deadline: ' + $('Build matrix').first().json.deadline,\n  $('Build matrix').first().json.drafted + ' drafted / ' + $('Build matrix').first().json.partial + ' partial / ' + $('Build matrix').first().json.human + ' need a human',\n  'Mandatory items still open: ' + $('Build matrix').first().json.mandatory_open + ' (' + $('Build matrix').first().json.mandatory_open_refs + ')'\n].join('\\n') }}"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1264,
+        544
+      ],
+      "id": "6be4b2b8-d7f6-4f82-a161-52f68688a966",
+      "name": "Send matrix",
+      "webhookId": "6d386119-0568-4261-bfc0-84ba00970fb3",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE rfps SET status = 'in_review' WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Start').first().json.rfp_id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1440,
+        544
+      ],
+      "id": "5e28df91-af7d-418f-9a5e-d3fbc37b3f3d",
+      "name": "Mark in review",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT r.id, r.title, r.deadline,\n  COUNT(*) FILTER (WHERE q.status IN ('needs_human','partial')) AS open_items,\n  COUNT(*) FILTER (WHERE q.mandatory AND q.status IN ('needs_human','partial')) AS open_mandatory\nFROM rfps r JOIN rfp_questions q ON q.rfp_id = r.id\nWHERE r.status = 'in_review' AND r.deadline <= NOW() + INTERVAL '3 days'\nGROUP BY r.id\nHAVING COUNT(*) FILTER (WHERE q.status IN ('needs_human','partial')) > 0;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        272,
+        1088
+      ],
+      "id": "2a3ca7c3-f5f1-49ca-a986-33f9f43d25a4",
+      "name": "Due soon",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Deadline warning: {{ $json.title }} is due {{ String($json.deadline).slice(0, 10) }}.\n{{ $json.open_items }} items still need a human ({{ $json.open_mandatory }} mandatory).",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        496,
+        1088
+      ],
+      "id": "c63118fc-519f-4e06-9db8-fe2277b09391",
+      "name": "Deadline alert",
+      "webhookId": "c73a7994-994a-42b7-88a7-39fb6c5978a9",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        480,
+        688
+      ],
+      "id": "b9eeeb28-064f-41a1-93c0-eae0a8390502",
+      "name": "Loop Over Items1"
+    },
+    {
+      "parameters": {
+        "content": "## 2. Draft answers, matrix and deadline watcher\nFor each question: embed, search the approved library, draft from the sources only, then run the guardrail. Then build the compliance matrix, send it to Telegram, and mark the RFP in review. A daily check alerts when a deadline is close.",
+        "height": 848,
+        "width": 2080,
+        "color": "#3B2C87"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        432
+      ],
+      "id": "a5e833c9-30ed-4c13-8d7e-f6fe17848452",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        32,
+        1088
+      ],
+      "id": "c7671446-70a8-4763-a35e-fa2bb62c0303",
+      "name": "Daily check"
+    },
+    {
+      "parameters": {
+        "content": "## 0. Seed the answer library\nUpload an approved company document, split it into chunks, embed each chunk with LM Studio, and store the vectors in pgvector. Duplicates are skipped.",
+        "height": 384,
+        "width": 1360,
+        "color": "#05662A"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1456,
+        224
+      ],
+      "id": "f56398c8-b7c6-4574-8941-6c35a6cb5bfd",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "formTitle": "Seed Library",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Document name",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Section",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "File",
+              "fieldType": "file",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        -1392,
+        384
+      ],
+      "id": "74a33b27-b69f-4bae-a98c-a09aa1ed9feb",
+      "name": "Seed Form",
+      "webhookId": "a56391f3-9a55-420a-9fe9-189fdc62ead3"
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "File",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -1200,
+        384
+      ],
+      "id": "b02012cb-ba40-4a41-ab50-985a5188c937",
+      "name": "Extract From Text File"
+    },
+    {
+      "parameters": {
+        "jsCode": "const f = $('Seed Form').first().json;\nconst source = f['Document name'] || 'unnamed';\nconst section = f['Section'] || 'general';\nconst text = ($json.text || $json.data || '').replace(/\\r/g, '');\n\nconst paras = text.split(/\\n{2,}/).map(p => p.trim()).filter(Boolean);\nconst chunks = [];\nlet cur = [], words = 0;\n\nfor (const p of paras) {\n  const w = p.split(/\\s+/).length;\n  if (words + w > 180 && cur.length) {\n    chunks.push(cur.join('\\n\\n'));\n    cur = [cur[cur.length - 1]];\n    words = cur[0].split(/\\s+/).length;\n  }\n  cur.push(p);\n  words += w;\n}\nif (cur.length) chunks.push(cur.join('\\n\\n'));\n\nreturn chunks.map((content, i) => ({ json: { source, section, chunk_index: i, content } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1008,
+        384
+      ],
+      "id": "68c304c3-72b3-4c49-be27-6a5c8384b84a",
+      "name": "Chunk"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:1234/v1/embeddings",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: \"text-embedding-nomic-embed-text-v1.5\", input: \"search_document: \" + $json.content } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -800,
+        384
+      ],
+      "id": "bf8db268-b6d8-4626-8077-1d9a6c1e601d",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "const chunks = $('Chunk').all();\n\nreturn $input.all().map((item, i) => {\n  const vec = item.json.data[0].embedding;\n  if (vec.length !== 768) {\n    throw new Error('Expected 768 dimensions, got ' + vec.length);\n  }\n  return {\n    json: {\n      ...chunks[i].json,\n      embedding: '[' + vec.join(',') + ']'\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -592,
+        384
+      ],
+      "id": "c2bfcd82-4d76-404f-86e8-5c5e7fb82699",
+      "name": "Attach vector"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO library_chunks (source, section, content, content_hash, embedding)\nVALUES ($1, $2, $3, md5($3::text), $4::vector)\nON CONFLICT (content_hash) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ [$json.source, $json.section, $json.content, $json.embedding] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -400,
+        384
+      ],
+      "id": "94d0d95b-b266-4c97-bcac-424b005721cd",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "RFP Intake": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Clean and window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean and window": {
+      "main": [
+        [
+          {
+            "node": "Save RFP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save RFP": {
+      "main": [
+        [
+          {
+            "node": "Extract metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract metadata": {
+      "main": [
+        [
+          {
+            "node": "Score bid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score bid": {
+      "main": [
+        [
+          {
+            "node": "Update RFP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update RFP": {
+      "main": [
+        [
+          {
+            "node": "Bid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bid?": {
+      "main": [
+        [
+          {
+            "node": "Split windows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No-bid alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split windows": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Dedupe questions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract requirements",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract requirements": {
+      "main": [
+        [
+          {
+            "node": "Parse window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse window": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedupe questions": {
+      "main": [
+        [
+          {
+            "node": "Save questions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save questions": {
+      "main": [
+        [
+          {
+            "node": "Run answer engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Get pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get pending": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed question": {
+      "main": [
+        [
+          {
+            "node": "Search library",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search library": {
+      "main": [
+        [
+          {
+            "node": "Build context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build context": {
+      "main": [
+        [
+          {
+            "node": "Has evidence?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has evidence?": {
+      "main": [
+        [
+          {
+            "node": "Draft answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No evidence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft answer": {
+      "main": [
+        [
+          {
+            "node": "Guardrail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardrail": {
+      "main": [
+        [
+          {
+            "node": "Save draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save draft": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No evidence": {
+      "main": [
+        [
+          {
+            "node": "Save draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get all questions": {
+      "main": [
+        [
+          {
+            "node": "Build matrix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build matrix": {
+      "main": [
+        [
+          {
+            "node": "Matrix file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Matrix file": {
+      "main": [
+        [
+          {
+            "node": "Send matrix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send matrix": {
+      "main": [
+        [
+          {
+            "node": "Mark in review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Due soon": {
+      "main": [
+        [
+          {
+            "node": "Deadline alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items1": {
+      "main": [
+        [
+          {
+            "node": "Get all questions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Embed question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily check": {
+      "main": [
+        [
+          {
+            "node": "Due soon",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Seed Form": {
+      "main": [
+        [
+          {
+            "node": "Extract From Text File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract From Text File": {
+      "main": [
+        [
+          {
+            "node": "Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Attach vector",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach vector": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "c1e9fe96-c0ea-4adb-aa85-a7d99192b7c8",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "3CgRUnhcZIjNvfek",
+  "tags": []
+}

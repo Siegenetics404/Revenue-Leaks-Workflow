@@ -1,0 +1,1248 @@
+{
+  "name": "Accounts Receivable and Payment Chasing",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "id": "ebf96f8c-149c-4620-8943-7e973448b241",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "function stageFor(daysOverdue) {\n  if (daysOverdue < 0) return null; // not due yet, skip\n  if (daysOverdue < 7) return 0;\n  if (daysOverdue < 21) return 1;\n  if (daysOverdue < 45) return 2;\n  return 3;\n}\n\nreturn $input.all()\n  .map(item => {\n    const l = item.json;\n    const stage = stageFor(l.days_overdue);\n    if (stage === null) return null;\n    return { json: { ...l, stage } };\n  })\n  .filter(Boolean);"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        352,
+        0
+      ],
+      "id": "39037535-e820-4dea-ad06-2aabf1e08dfe",
+      "name": "Assign Escalation Stage"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT *, (CURRENT_DATE - due_date) AS days_overdue\nFROM invoices\nWHERE status IN ('unpaid','reminded')\n  AND dispute_flag = FALSE\n  AND (next_action_at IS NULL OR next_action_at <= NOW())\nORDER BY amount DESC\nLIMIT 10;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        176,
+        0
+      ],
+      "id": "b6d7afc5-5b08-484a-b6c4-90ae711d38a6",
+      "name": "Get Due Invoices",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "96298b50-589d-43d7-94e4-70841c91f60f",
+              "leftValue": "={{ $json.stage }}",
+              "rightValue": 3,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        512,
+        0
+      ],
+      "id": "de1c47d5-daba-4a4b-bb16-0c3de4879774",
+      "name": "Is Final Stage"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "={{ $json.company }} is 45+ days overdue on {{ $json.invoice_number }} ({{ $json.currency }} {{ $json.amount }}). Auto-chasing stopped, needs a human call.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        688,
+        -128
+      ],
+      "id": "f93e9d8f-1294-43ee-9c15-cfc77ea31a37",
+      "name": "Alert Final Stage",
+      "webhookId": "96c11fbd-522b-4e8b-b298-5388e641ac12",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE invoices SET\n  status = 'escalated_human'\nWHERE id = {{ $('Is Final Stage').item.json.id }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        848,
+        -128
+      ],
+      "id": "c256fcc8-ca66-46c1-b499-d4229341f08a",
+      "name": "Mark Escalated",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        688,
+        80
+      ],
+      "id": "8c513c93-e6b2-463c-aa05-5f73dd9f7380",
+      "name": "Loop Invoices"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output?.[0]?.content?.[0]?.text ?? $json.message?.content ?? $json.content ?? \"\";\n\nlet parsed;\ntry {\n  parsed = typeof raw === \"string\"\n    ? JSON.parse(raw.replace(/```json|```/g, \"\").trim())\n    : raw;\n} catch (e) {\n  return [{ json: { ...$('Loop Invoices').item.json, valid: false, fail: \"unparseable\" } }];\n}\n\nconst src = $('Loop Invoices').item.json;\nconst body = (parsed.body || \"\").trim();\nconst words = body.split(/\\s+/).length;\n\nconst amountStr = Number(src.amount).toLocaleString();\n\nconst checks = {\n  hasBody:           body.length > 30,\n  lengthOk:          words >= 35 && words <= 110,\n  hasInvoiceNumber:  body.includes(src.invoice_number),\n  hasAmount:         body.includes(amountStr) || body.includes(String(src.amount)),\n  noExtraMoney:      (body.match(/[\\$£€]\\s?\\d[\\d,]*(\\.\\d+)?/g) || []).length <= 1,\n  noCollectionsLang: !/collections?|legal action|credit report|attorney/i.test(body),\n  noInventedTerms:   !/late fee|interest charge|discount|waive/i.test(body),\n  hasSubject:        (parsed.subject || \"\").length > 5 && parsed.subject.length < 70\n};\n\nconst failed = Object.entries(checks).filter(([,v]) => !v).map(([k]) => k);\n\nreturn [{ json: {\n  ...src,\n  subject: parsed.subject,\n  body,\n  valid: failed.length === 0,\n  fail: failed.join(\",\")\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        96
+      ],
+      "id": "1d1b2908-a5f7-47f9-9cbd-de29b3d407ff",
+      "name": "Validate Draft"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "acd4cd8c-b04d-45f3-84ee-0fa249e41d6e",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1456,
+        96
+      ],
+      "id": "88e34532-9f98-4f9c-83f4-dfbda365dd77",
+      "name": "Is Draft Valid"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Draft failed for {{ $json.invoice_number }} — {{ $json.fail }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1632,
+        208
+      ],
+      "id": "c1f4ad1a-c1a9-4147-afd5-a86af50c5d82",
+      "name": "Alert Draft Failed",
+      "webhookId": "b4f158cb-c751-4fb4-bf01-cf928a3f6bc8",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "=franco.cj03@gmail.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "=[AR-Chase] {{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1632,
+        -64
+      ],
+      "id": "104945a9-c112-402e-9955-c013ee64a280",
+      "name": "Send Chase Email",
+      "webhookId": "086ba95a-7077-44e1-9f20-513f00eaf99c",
+      "credentials": {
+        "smtp": {
+          "id": "4jlPLz6lxGd7NpWX",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are writing a short, professional accounts-receivable follow-up email.\n\nRULES:\n- Write AT LEAST 50 words and no more than 80 words in the body. This is a hard minimum, not a suggestion. If your draft feels complete before 50 words, add one more relevant sentence (e.g. restate the impact of the overdue payment, offer to answer questions, or note how to reach you) rather than stopping early.\n- Tone must match the given stage: 0=friendly reminder, 1=polite nudge, 2=firm but respectful.\n- You will be given exact facts: invoice number, amount, currency, due date, days overdue.\n  Use every one of these exactly as given, verbatim. Do not compute, round, or restate them differently.\n- Do not invent any late fee, interest charge, discount, or payment plan. If none is given, don't mention one.\n- Do not use collections or legal language (\"legal action\", \"collections agency\", \"credit report\") at any stage.\n- One clear question at the end asking for a payment date or confirmation.\n- No em-dashes, no exclamation marks.\n\nBefore returning, count the words in your body. If it is under 50 words, add another sentence and count again.\n\nReturn ONLY valid JSON, no markdown fences:\n{\"subject\": \"...\", \"body\": \"...\"}"
+            },
+            {
+              "content": "=Client: {{ $json.client_name }} at {{ $json.company }}\nInvoice: {{ $json.invoice_number }}\nAmount: {{ $json.currency }} {{ $json.amount }}\nDue date: {{ $json.due_date }}\nDays overdue: {{ $json.days_overdue }}\nStage: {{ $json.stage }}\n\nWrite the email. Sign as \"CJ\"."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        944,
+        96
+      ],
+      "id": "91959595-84a7-4fe6-a7a4-ab172343f13d",
+      "name": "Draft Chase Email",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 2
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1840,
+        96
+      ],
+      "id": "e1f7fd35-4cd3-4e51-afea-57a74c787872",
+      "name": "Throttle Send",
+      "webhookId": "2ea25320-4e7e-45da-bce2-53a22fa596bd"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE invoices SET\n  status = 'reminded',\n  escalation_stage = $2,\n  last_contact_date = CURRENT_DATE,\n  last_sent_body = $3,\n  next_action_at = CASE\n    WHEN $2 = 0 THEN NOW() + INTERVAL '7 days'\n    WHEN $2 = 1 THEN NOW() + INTERVAL '14 days'\n    WHEN $2 = 2 THEN NOW() + INTERVAL '24 days'\n  END\nWHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ $('Validate Draft').item.json.id }}, {{ $('Validate Draft').item.json.stage }}, {{ $('Validate Draft').item.json.body }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2048,
+        224
+      ],
+      "id": "5fbd476e-5bb0-424e-8220-17e70518c49a",
+      "name": "Update After Send",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## AR — Chase Sequence (A)\nFinds overdue invoices and sends a stage-matched AI reminder with guardrail-checked facts. Invoices 45+ days overdue skip the email and alert a human instead.",
+        "height": 768,
+        "width": 2288
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        -240
+      ],
+      "id": "55ce2ef8-06ab-422d-928e-2e91d8b4483e",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "mailbox": "AR-Chase",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.2,
+      "position": [
+        2320,
+        -352
+      ],
+      "id": "dd1e6482-44e0-4e65-a663-48f634c386d8",
+      "name": "Watch AR Replies",
+      "credentials": {
+        "imap": {
+          "id": "dVc9Ye84ZzY50NgT",
+          "name": "IMAP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.textPlain || $json.text || \"\";\nconst clean = body.split(/On .* wrote:|-----Original Message-----|^>/m)[0].trim();\n\nreturn [{ json: {\n  from: $json.from?.value?.[0]?.address || $json.from,\n  reply: clean.slice(0, 1500)\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2512,
+        -352
+      ],
+      "id": "b8158916-4bc7-4b06-b2f3-f51547fb662b",
+      "name": "Extract Reply Text"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "=Classify this email reply into exactly one category.\n\nCategories:\nPAYMENT_PROMISE - commits to a payment date, explicit or implied (\"will send Friday\")\nALREADY_PAID - claims payment was already sent\nDISPUTE - disputes the amount, the invoice itself, or work delivered\nNEGOTIATION - asks for a payment plan, extension, or partial payment\nQUESTION - asks something but doesn't commit either way\nSTOP - asks not to be contacted, or uses legal/harassment language\nAUTO_REPLY - out of office, bounce, autoresponder\n\nIf the category is PAYMENT_PROMISE, also extract the exact phrase used for timing (e.g. \"Friday\", \"next Monday\", \"in 3 days\", \"end of month\") as promised_date_phrase. Do not calculate an actual calendar date yourself — just return the phrase as written.\n\nReturn ONLY valid JSON, no markdown fences:\n{\"category\":\"...\", \"confidence\":0.0-1.0, \"promised_date_phrase\":\"... or null\", \"summary\":\"under 15 words\"}"
+            },
+            {
+              "content": "={{ $json.reply }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        2704,
+        -352
+      ],
+      "id": "03f29478-94a4-4de7-8009-ba841b5e7c1e",
+      "name": "Classify Reply",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const classification = (() => {\n  const raw = $json.output?.[0]?.content?.[0]?.text ?? $json.message?.content ?? $json.content ?? \"{}\";\n  try {\n    return typeof raw === \"string\" ? JSON.parse(raw.replace(/```json|```/g, \"\").trim()) : raw;\n  } catch (e) {\n    return { category: \"QUESTION\", confidence: 0, summary: \"unparseable\" };\n  }\n})();\n\nconst replyText = $('Extract Reply Text').item.json.reply || \"\";\n\nconst weekdays = [\"sunday\",\"monday\",\"tuesday\",\"wednesday\",\"thursday\",\"friday\",\"saturday\"];\n\nfunction nextWeekday(name) {\n  const target = weekdays.indexOf(name.toLowerCase());\n  if (target === -1) return null;\n  const today = new Date();\n  const todayDow = today.getDay();\n  let diff = (target - todayDow + 7) % 7;\n  if (diff === 0) diff = 7; // \"Friday\" said on a Friday means next Friday, not today\n  const result = new Date(today);\n  result.setDate(today.getDate() + diff);\n  return result.toISOString().slice(0, 10);\n}\n\nlet promisedDate = null;\nconst dayMatch = replyText.match(/\\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\\b/i);\nconst tomorrowMatch = /\\btomorrow\\b/i.test(replyText);\nconst todayMatch = /\\btoday\\b/i.test(replyText);\n\nif (todayMatch) {\n  promisedDate = new Date().toISOString().slice(0, 10);\n} else if (tomorrowMatch) {\n  const d = new Date();\n  d.setDate(d.getDate() + 1);\n  promisedDate = d.toISOString().slice(0, 10);\n} else if (dayMatch) {\n  promisedDate = nextWeekday(dayMatch[1]);\n}\n\nreturn [{ json: {\n  ...$('Extract Reply Text').item.json,\n  category: classification.category,\n  confidence: classification.confidence,\n  summary: classification.summary,\n  promised_date: promisedDate\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3008,
+        -352
+      ],
+      "id": "6a0a9397-d8ec-40ef-ad8a-4563a92fa9e4",
+      "name": "Resolve Promise Date"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "PAYMENT_PROMISE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "425d607d-84cb-4620-ac51-751ebeef8073"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "63972857-af15-4b97-9e02-5e0c1dd86db4",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "ALREADY_PAID",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "52f3992a-4e81-4d3d-beb4-73285a778c09",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "DISPUTE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "35575fd2-3ae0-4679-80f7-756adb3a7eec",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "NEGOTIATION",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "3a3233a6-5b8d-438c-9782-aa7b55832a3c",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "QUESTION",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "df062257-d246-446e-a768-8833d3f711e4",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "STOP",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "ec2103ac-d9e6-4f00-8e3d-c67cd5acd7ae",
+                    "leftValue": "={{ $json.category }}",
+                    "rightValue": "AUTO_REPLY",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": 4
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        2736,
+        0
+      ],
+      "id": "adafa7fd-941f-4d76-9dec-a3fdb950bc8c",
+      "name": "Route By Category"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE invoices SET\n  status = 'promised',\n  promised_pay_date = $2,\n  next_action_at = $2::date + INTERVAL '2 days'\nWHERE email = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.from.match(/<(.+)>/)?.[1] || $json.from }}, {{ $json.promised_date }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3392,
+        -576
+      ],
+      "id": "a4bf353a-1e8a-456c-8087-306e679d96c6",
+      "name": "Update Promised Payment",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE invoices SET\n  status = 'pending_verification'\nWHERE email = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.from.match(/<(.+)>/)?.[1] || $json.from }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3392,
+        -368
+      ],
+      "id": "d3835bac-08e5-4d92-b795-03e5532782c9",
+      "name": "Flag Pending Verification",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "={{ $json.from }} claims their invoice is already paid. Verify against bank/Stripe before marking closed.\n\nSummary: {{ $json.summary }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3552,
+        -368
+      ],
+      "id": "57b92592-ca66-4494-bc8d-688712e9328c",
+      "name": "Alert Payment Claim",
+      "webhookId": "cd6610fd-fbec-49bb-a591-e48d1a0409bd",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE invoices SET\n  status = 'disputed',\n  dispute_flag = TRUE\nWHERE email = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.from.match(/<(.+)>/)?.[1] || $json.from }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3392,
+        -176
+      ],
+      "id": "c5a1245c-e420-42e9-8d59-c163d03e2a18",
+      "name": "Flag Disputed",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=🚩 DISPUTE on invoice from {{ $json.from }}. Chasing stopped. Needs human review immediately.\n\nSummary: {{ $json.summary }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3552,
+        -176
+      ],
+      "id": "90d4baa4-59e6-4ae2-8dc5-2d0c5f4e93bb",
+      "name": "Alert Dispute",
+      "webhookId": "cd6610fd-fbec-49bb-a591-e48d1a0409bd",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE invoices SET\n  status = 'negotiating'\nWHERE email = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.from.match(/<(.+)>/)?.[1] || $json.from }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3392,
+        16
+      ],
+      "id": "9dfe4be7-8bd8-470e-a15a-118c9af835f9",
+      "name": "Flag Negotiating",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "={{ $json.from }} is asking for a payment plan or extension. Needs a human to set terms.\n\nSummary: {{ $json.summary }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3552,
+        16
+      ],
+      "id": "68188e54-7dbd-4c52-b34e-3553a0d4236f",
+      "name": "Alert Negotiation Request",
+      "webhookId": "cd6610fd-fbec-49bb-a591-e48d1a0409bd",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "={{ $json.from }} replied with a question, not a commitment. Needs a human reply.\n\nSummary: {{ $json.summary }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3392,
+        208
+      ],
+      "id": "308d9f8a-2398-49b1-acf3-3f3fe6a3cd84",
+      "name": "Alert Question",
+      "webhookId": "cd6610fd-fbec-49bb-a591-e48d1a0409bd",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE invoices SET\n  notes = COALESCE(notes || ' | ', '') || 'STOP request received, needs manual review'\nWHERE email = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.from.match(/<(.+)>/)?.[1] || $json.from }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3392,
+        432
+      ],
+      "id": "ba25e166-c392-4e1e-9cdc-db1f9df420e1",
+      "name": "Flag Stop Request",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "={{ $json.from }} asked not to be contacted (or used legal/harassment language). Sequence NOT auto-stopped, this needs manual review before responding.\n\nSummary: {{ $json.summary }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3552,
+        432
+      ],
+      "id": "d91b3abf-d572-4288-86ac-d45b89962db1",
+      "name": "Alert Stop Request",
+      "webhookId": "cd6610fd-fbec-49bb-a591-e48d1a0409bd",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3392,
+        640
+      ],
+      "id": "433f3af3-9519-4ef7-b233-bf571386c6d1",
+      "name": "No Operation, do nothing"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "88db1da4-fa5f-4d3a-bd83-5a064fb4f1cd",
+              "leftValue": "={{ $json.confidence }}",
+              "rightValue": 0.7,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2496,
+        288
+      ],
+      "id": "0556562a-1fc1-4eb9-b2d0-1378d54cbe92",
+      "name": "Is Confident"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Low-confidence classification ({{ $json.confidence }}) on reply from {{ $json.from }}. Category guessed: {{ $json.category }}. Needs manual read.\n\nSummary: {{ $json.summary }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2720,
+        384
+      ],
+      "id": "199eca2d-7dd3-4a80-92c4-ceadcac3c815",
+      "name": "Alert Low Confidence",
+      "webhookId": "cd6610fd-fbec-49bb-a591-e48d1a0409bd",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## AR — Reply Handling (B)\nClassifies replies (promise, paid claim, dispute, etc.) and either reschedules automatically or alerts a human, never acting blindly on risky replies.",
+        "height": 1424,
+        "width": 1488,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2256,
+        -624
+      ],
+      "id": "d3fa2f0c-63d4-4863-9487-9b4b60c1786c",
+      "name": "Sticky Note1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Due Invoices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Due Invoices": {
+      "main": [
+        [
+          {
+            "node": "Assign Escalation Stage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign Escalation Stage": {
+      "main": [
+        [
+          {
+            "node": "Is Final Stage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Final Stage": {
+      "main": [
+        [
+          {
+            "node": "Alert Final Stage",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Invoices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Final Stage": {
+      "main": [
+        [
+          {
+            "node": "Mark Escalated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Invoices": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Draft Chase Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Draft": {
+      "main": [
+        [
+          {
+            "node": "Is Draft Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Draft Valid": {
+      "main": [
+        [
+          {
+            "node": "Send Chase Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Draft Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Draft Failed": {
+      "main": [
+        []
+      ]
+    },
+    "Send Chase Email": {
+      "main": [
+        [
+          {
+            "node": "Throttle Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Chase Email": {
+      "main": [
+        [
+          {
+            "node": "Validate Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Throttle Send": {
+      "main": [
+        [
+          {
+            "node": "Update After Send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update After Send": {
+      "main": [
+        [
+          {
+            "node": "Loop Invoices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Watch AR Replies": {
+      "main": [
+        [
+          {
+            "node": "Extract Reply Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Reply Text": {
+      "main": [
+        [
+          {
+            "node": "Classify Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Reply": {
+      "main": [
+        [
+          {
+            "node": "Resolve Promise Date",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Promise Date": {
+      "main": [
+        [
+          {
+            "node": "Is Confident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route By Category": {
+      "main": [
+        [
+          {
+            "node": "Update Promised Payment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Pending Verification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Disputed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Negotiating",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Question",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Stop Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Pending Verification": {
+      "main": [
+        [
+          {
+            "node": "Alert Payment Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Disputed": {
+      "main": [
+        [
+          {
+            "node": "Alert Dispute",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Negotiating": {
+      "main": [
+        [
+          {
+            "node": "Alert Negotiation Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Stop Request": {
+      "main": [
+        [
+          {
+            "node": "Alert Stop Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Confident": {
+      "main": [
+        [
+          {
+            "node": "Route By Category",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Low Confidence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "eea7519f-4e05-409b-aab5-9122efacb9f1",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "vyecyh9EQpZ08WVK",
+  "tags": []
+}

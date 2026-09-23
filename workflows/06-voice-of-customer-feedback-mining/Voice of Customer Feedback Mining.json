@@ -1,0 +1,741 @@
+{
+  "name": "Voice of Customer Feedback Mining",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM feedback_items\nWHERE status = 'new'\nORDER BY submitted_at ASC\nLIMIT 15;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        160,
+        0
+      ],
+      "id": "eafe46f6-5347-472d-97ea-15e5ba02c8b7",
+      "name": "Get New Feedback",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        336,
+        0
+      ],
+      "id": "50c948ff-4a46-4f55-bc0c-630177a8d519",
+      "name": "Loop Feedback"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a customer feedback analyst. You extract structured signal from raw customer feedback.\n\nTAXONOMY (choose 1-3 that genuinely apply, do not force a fit):\npricing, onboarding, reliability_bugs, feature_request, customer_support,\nperformance_speed, ui_ux, documentation, integration, billing, other\n\nSEVERITY:\ncritical - explicit churn threat, refund demand, legal/safety/security issue\nhigh - strong frustration, blocking problem, repeated complaint\nmedium - real issue but not urgent or blocking\nlow - minor gripe, or feedback is neutral/positive\n\nSENTIMENT: positive, neutral, negative, mixed\n\nRULES:\n- key_quote MUST be copied character-for-character from the customer's text. Never paraphrase it, never invent it.\n- If the feedback is too vague to extract a real theme, use \"other\" and quote whatever is most representative.\n- Do not infer facts not present in the text.\n\nReturn ONLY valid JSON, no markdown fences:\n{\"sentiment\":\"...\",\"severity\":\"...\",\"themes\":[\"...\",\"...\"],\"key_quote\":\"...\"}"
+            },
+            {
+              "content": "=Source: {{ $json.source }}\nRating: {{ $json.rating }}\nCustomer feedback:\n\"{{ $json.raw_text }}\""
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        560,
+        16
+      ],
+      "id": "cd776693-79be-426d-a913-3f27c24442bc",
+      "name": "Classify Feedback",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output?.[0]?.content?.[0]?.text\n  ?? $json.message?.content\n  ?? $json.content\n  ?? \"\";\n\nlet parsed;\ntry {\n  parsed = typeof raw === \"string\"\n    ? JSON.parse(raw.replace(/```json|```/g, \"\").trim())\n    : raw;\n} catch (e) {\n  return [{ json: { ...$('Loop Feedback').item.json, valid: false, fail: \"unparseable\" } }];\n}\n\nconst item = $('Loop Feedback').item.json;\nconst allowedThemes = [\"pricing\",\"onboarding\",\"reliability_bugs\",\"feature_request\",\n  \"customer_support\",\"performance_speed\",\"ui_ux\",\"documentation\",\"integration\",\"billing\",\"other\"];\nconst allowedSeverity = [\"critical\",\"high\",\"medium\",\"low\"];\nconst allowedSentiment = [\"positive\",\"neutral\",\"negative\",\"mixed\"];\n\nconst quote = (parsed.key_quote || \"\").trim().replace(/^[\"']|[\"']$/g, \"\");\n\nfunction normalize(s) {\n  return (s || \"\").replace(/['’‘]/g, \"\").toLowerCase();\n}\n\nconst validThemes = Array.isArray(parsed.themes)\n  ? parsed.themes.filter(t => allowedThemes.includes(t))\n  : [];\n\nconst checks = {\n  quoteIsReal:    quote.length > 0 && normalize(item.raw_text).includes(normalize(quote)),\n  themesValid:    validThemes.length > 0 && validThemes.length <= 3,\n  severityValid:  allowedSeverity.includes(parsed.severity),\n  sentimentValid: allowedSentiment.includes(parsed.sentiment)\n};\n\nconst failed = Object.entries(checks).filter(([,v]) => !v).map(([k]) => k);\n\nreturn [{ json: {\n  ...item,\n  sentiment: parsed.sentiment,\n  severity: parsed.severity,\n  themes: validThemes,\n  key_quote: quote,\n  valid: failed.length === 0,\n  fail: failed.join(\",\")\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        16
+      ],
+      "id": "582e3c1a-dd7f-49ee-801c-43085c08f446",
+      "name": "Verify Quote & Tags"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "38a5ef33-4c63-42ea-b4eb-81ff2b27d762",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1072,
+        16
+      ],
+      "id": "4810a6f0-2641-4880-ad07-101e63884c67",
+      "name": "Is Valid?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE feedback_items SET status = 'flagged_invalid' WHERE id = {{ $json.id }};",
+        "options": {
+          "queryReplacement": "=Classification failed for feedback #{{ $json.id }} ({{ $json.customer_name }}) — {{ $json.fail }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1360,
+        176
+      ],
+      "id": "ec6c0ed9-b316-4336-894a-7f9cd932d624",
+      "name": "Flag Invalid",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "8d7820e9-9be1-45d5-8689-a4fd502337fc",
+              "leftValue": "={{ $json.severity }}",
+              "rightValue": "critical",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1344,
+        -112
+      ],
+      "id": "60a2c2d4-78cf-4bb1-8990-ae6e89f4e44e",
+      "name": "Is Critical?"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=🚨 Critical feedback from {{ $json.customer_name }} ({{ $json.source }}): \"{{ $json.key_quote }}\"",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1664,
+        -192
+      ],
+      "id": "93d835ac-b75e-4cf2-999c-f2092d90bd4a",
+      "name": "Notify Critical",
+      "webhookId": "234d0602-c46a-4bfd-bd02-d8095a6331de",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE feedback_items SET\n  status = 'processed',\n  sentiment = $1,\n  severity = $2,\n  themes = $3,\n  key_quote = $4,\n  processed_at = NOW()\nWHERE id = $5;",
+        "options": {
+          "queryReplacement": "={{ [$json.sentiment, $json.severity, JSON.stringify($json.themes), $json.key_quote, $json.id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1664,
+        -32
+      ],
+      "id": "e6f1d965-3c08-4b77-8239-0260a6b5f5d7",
+      "name": "Mark Processed",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Classification failed for feedback #{{ $('Verify Quote & Tags').item.json.id }} ({{ $('Verify Quote & Tags').item.json.customer_name }}) — {{ $('Verify Quote & Tags').item.json.fail }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1664,
+        176
+      ],
+      "id": "e0caecd1-cd80-4937-a9f8-30bed10d8574",
+      "name": "Notify Invalid",
+      "webhookId": "054418b5-f4af-4d2b-b4b8-d43cd6e6a142",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Voice of Customer — Feedback Classification\nTags every piece of incoming feedback by sentiment, severity, and theme using a local AI model, with every tag backed by a guardrail-checked quote from the real feedback text — and instant alerts on anything critical.",
+        "height": 640,
+        "width": 1920
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        -224
+      ],
+      "id": "c8230d2c-628a-4e61-99f0-d9358180e496",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -16,
+        672
+      ],
+      "id": "472b1d9a-b703-42a5-9bf7-ba5b7a3e6b07",
+      "name": "Weekly Digest Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, source, rating, sentiment, severity, themes, key_quote, customer_name, submitted_at\nFROM feedback_items\nWHERE status = 'processed'\n  AND submitted_at >= NOW() - INTERVAL '14 days';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        176,
+        672
+      ],
+      "id": "4b67d770-61d4-4a63-8124-8f518d709780",
+      "name": "Get Recent Feedback",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst cutoff = new Date();\ncutoff.setDate(cutoff.getDate() - 7);\n\nconst thisWeek = rows.filter(r => new Date(r.submitted_at) >= cutoff);\nconst lastWeek = rows.filter(r => new Date(r.submitted_at) < cutoff);\n\nfunction countThemes(set) {\n  const counts = {};\n  set.forEach(r => (r.themes || []).forEach(t => counts[t] = (counts[t] || 0) + 1));\n  return counts;\n}\n\nconst thisCounts = countThemes(thisWeek);\nconst lastCounts = countThemes(lastWeek);\n\nconst themeTrend = Object.keys(thisCounts).map(theme => ({\n  theme,\n  count: thisCounts[theme],\n  prevCount: lastCounts[theme] || 0,\n  delta: thisCounts[theme] - (lastCounts[theme] || 0)\n})).sort((a, b) => b.count - a.count);\n\nconst sentimentSplit = [\"positive\",\"neutral\",\"negative\",\"mixed\"].map(s => ({\n  sentiment: s,\n  count: thisWeek.filter(r => r.sentiment === s).length\n}));\n\nconst topQuotesByTheme = {};\nthemeTrend.slice(0, 5).forEach(t => {\n  topQuotesByTheme[t.theme] = thisWeek\n    .filter(r => (r.themes || []).includes(t.theme))\n    .slice(0, 2)\n    .map(r => r.key_quote);\n});\n\nconst criticalItems = thisWeek\n  .filter(r => r.severity === 'critical')\n  .map(r => ({ customer_name: r.customer_name, quote: r.key_quote }));\n\nreturn [{ json: {\n  weekOf: cutoff.toISOString().slice(0,10),\n  totalFeedback: thisWeek.length,\n  criticalCount: thisWeek.filter(r => r.severity === 'critical').length,\n  criticalItems,\n  themeTrend,\n  sentimentSplit,\n  topQuotesByTheme\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        368,
+        672
+      ],
+      "id": "f6900b65-859b-4c78-ab2b-6814d658961b",
+      "name": "Aggregate Trends"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You write a short executive summary for a weekly customer feedback digest.\nUse ONLY the numbers, themes, and quotes given to you. Never invent a statistic, theme, or quote not present in the input.\n\nYour summary MUST include, in this order:\n1. The exact totalFeedback number, stated as \"X pieces of feedback this week\"\n2. The single biggest theme by volume (highest count in themeTrend) and its delta vs last week\n3. If criticalCount is above 0: the exact number, and the exact customer_name value(s) from criticalItems - use their real names, never a placeholder like \"Customer X\" or \"Customer1\"\n4. If criticalCount is 0: skip this point entirely, do not mention critical issues at all\n\nThe word \"critical\" refers ONLY to the criticalCount field and criticalItems list. Do not call anything else \"critical\" - use \"notable\" or \"recurring\" for other issues instead.\n\nPlain, direct, no corporate filler (\"synergy\", \"leverage\"). 3-5 sentences."
+            },
+            {
+              "content": "={{ JSON.stringify($json) }}\n\nIf criticalCount is above 0, you MUST include this exact sentence verbatim, adapted only grammatically: \"There were {{ $json.criticalCount }} critical issues this week, from {{ $json.criticalItems.map(c => c.customer_name).join(' and ') }}.\""
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        560,
+        672
+      ],
+      "id": "6cfad7ce-eb38-4f1e-9cb0-233e5ed7c385",
+      "name": "Write Summary",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output?.[0]?.content?.[0]?.text\n  ?? $json.message?.content\n  ?? $json.content\n  ?? \"\";\n\nconst summary = (raw || \"\").trim();\nconst data = $('Aggregate Trends').item.json;\n\nconst mentionsTotal = summary.includes(String(data.totalFeedback));\n\nconst criticalNamesOk = data.criticalCount > 0\n  ? (data.criticalItems || []).length > 0 &&\n    (data.criticalItems || []).every(c => summary.includes(c.customer_name))\n  : true;\n\nconst checks = {\n  hasSummary:        summary.length > 20 && summary.length < 900,\n  totalReferenced:   mentionsTotal,\n  criticalNamesReal: criticalNamesOk\n};\n\nconst failed = Object.entries(checks).filter(([,v]) => !v).map(([k]) => k);\n\nreturn [{ json: {\n  ...data,\n  summary,\n  valid: failed.length === 0,\n  fail: failed.join(\",\")\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        864,
+        672
+      ],
+      "id": "b729e662-0f81-4e39-b89d-0564a80bb887",
+      "name": "Verify Summary"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "41d794f0-4672-49dd-8a7e-7f7a8f72cd00",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1056,
+        672
+      ],
+      "id": "b2f8f8f0-21af-4301-9130-a557a3eef4f7",
+      "name": "Is Summary Valid?"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Weekly feedback digest failed validation for week of {{ $json.weekOf }} — reason: {{ $json.fail }}. Summary was not sent, check manually.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1264,
+        752
+      ],
+      "id": "05a1c60c-1ac8-4cb9-b78c-3b648ec0f83e",
+      "name": "Notify Digest Failed",
+      "webhookId": "054418b5-f4af-4d2b-b4b8-d43cd6e6a142",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $json;\n\nconst arrow = (delta) => delta > 0 ? '▲' : delta < 0 ? '▼' : '→';\nconst arrowColor = (delta) => delta > 0 ? '#dc2626' : delta < 0 ? '#16a34a' : '#6b7280';\n\nconst themeRows = d.themeTrend.slice(0, 8).map(t => `\n  <tr>\n    <td style=\"padding:8px 12px;border-bottom:1px solid #e5e7eb;\">${t.theme}</td>\n    <td style=\"padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:center;\">${t.count}</td>\n    <td style=\"padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:center;color:${arrowColor(t.delta)};\">\n      ${arrow(t.delta)} ${t.delta >= 0 ? '+' : ''}${t.delta}\n    </td>\n  </tr>`).join('');\n\nconst sentimentColors = { positive: '#16a34a', neutral: '#6b7280', negative: '#dc2626', mixed: '#d97706' };\nconst sentimentChips = d.sentimentSplit.map(s => `\n  <span style=\"display:inline-block;margin:0 8px 8px 0;padding:6px 14px;border-radius:16px;background:${sentimentColors[s.sentiment]}20;color:${sentimentColors[s.sentiment]};font-size:13px;font-weight:600;\">\n    ${s.sentiment}: ${s.count}\n  </span>`).join('');\n\nconst criticalBlock = (d.criticalItems || []).length > 0 ? `\n  <div style=\"background:#fef2f2;border-left:4px solid #dc2626;padding:16px 20px;margin:20px 0;border-radius:4px;\">\n    <div style=\"font-weight:700;color:#991b1b;margin-bottom:10px;\">🚨 ${d.criticalCount} Critical Issue${d.criticalCount > 1 ? 's' : ''}</div>\n    ${d.criticalItems.map(c => `\n      <div style=\"margin-bottom:8px;font-size:14px;color:#7f1d1d;\">\n        <strong>${c.customer_name}:</strong> \"${c.quote}\"\n      </div>`).join('')}\n  </div>` : '';\n\nconst quotesBlock = Object.entries(d.topQuotesByTheme).map(([theme, quotes]) => `\n  <div style=\"margin-bottom:16px;\">\n    <div style=\"font-weight:600;font-size:13px;color:#374151;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;\">${theme}</div>\n    ${quotes.map(q => `<div style=\"font-size:14px;color:#4b5563;font-style:italic;padding:4px 0 4px 12px;border-left:2px solid #d1d5db;margin-bottom:4px;\">\"${q}\"</div>`).join('')}\n  </div>`).join('');\n\nconst html = `\n<div style=\"font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:640px;margin:0 auto;color:#111827;\">\n  <div style=\"background:#111827;padding:24px 28px;border-radius:8px 8px 0 0;\">\n    <h1 style=\"color:#fff;margin:0;font-size:20px;\">Weekly Voice of Customer Digest</h1>\n    <p style=\"color:#9ca3af;margin:4px 0 0;font-size:14px;\">Week of ${d.weekOf}</p>\n  </div>\n\n  <div style=\"border:1px solid #e5e7eb;border-top:none;padding:24px 28px;border-radius:0 0 8px 8px;\">\n    <p style=\"font-size:15px;line-height:1.6;color:#374151;\">${d.summary}</p>\n\n    <div style=\"display:flex;gap:16px;margin:20px 0;\">\n      <div style=\"flex:1;background:#f9fafb;padding:14px;border-radius:6px;text-align:center;\">\n        <div style=\"font-size:24px;font-weight:700;\">${d.totalFeedback}</div>\n        <div style=\"font-size:12px;color:#6b7280;\">Total Feedback</div>\n      </div>\n      <div style=\"flex:1;background:#f9fafb;padding:14px;border-radius:6px;text-align:center;\">\n        <div style=\"font-size:24px;font-weight:700;color:${d.criticalCount > 0 ? '#dc2626' : '#111827'};\">${d.criticalCount}</div>\n        <div style=\"font-size:12px;color:#6b7280;\">Critical</div>\n      </div>\n    </div>\n\n    ${criticalBlock}\n\n    <h2 style=\"font-size:15px;margin:24px 0 12px;\">Theme Trends</h2>\n    <table style=\"width:100%;border-collapse:collapse;font-size:14px;\">\n      <tr style=\"background:#f9fafb;\">\n        <th style=\"padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;\">THEME</th>\n        <th style=\"padding:8px 12px;text-align:center;font-size:12px;color:#6b7280;\">COUNT</th>\n        <th style=\"padding:8px 12px;text-align:center;font-size:12px;color:#6b7280;\">VS LAST WK</th>\n      </tr>\n      ${themeRows}\n    </table>\n\n    <h2 style=\"font-size:15px;margin:24px 0 12px;\">Sentiment</h2>\n    <div>${sentimentChips}</div>\n\n    <h2 style=\"font-size:15px;margin:24px 0 12px;\">Top Verbatims by Theme</h2>\n    ${quotesBlock}\n  </div>\n</div>`;\n\nreturn [{ json: { ...d, digestBody: html } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        544
+      ],
+      "id": "92936e5a-3ba5-44f9-af3a-2259992cfbcd",
+      "name": "Format Digest"
+    },
+    {
+      "parameters": {
+        "fromEmail": "franco.cj03@gmail.com",
+        "toEmail": "franco.cj03@gmail.com",
+        "subject": "=Weekly Voice of Customer Digest — Week of {{ $json.weekOf }}",
+        "html": "={{ $json.digestBody }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1456,
+        544
+      ],
+      "id": "d36475fc-a206-4936-abca-816adc11f5cc",
+      "name": "Send an Email",
+      "webhookId": "399b52ee-7dc9-4ca3-b6ba-43e092b55615",
+      "credentials": {
+        "smtp": {
+          "id": "4jlPLz6lxGd7NpWX",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Voice of Customer — Weekly Trend Digest\nRolls a week's classified feedback into theme trends, sentiment splits, and top verbatims, with an AI-written summary checked against the real numbers before it's emailed out as a styled report.",
+        "height": 464,
+        "width": 1936,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        464
+      ],
+      "id": "281df910-78df-4161-b599-0f4575a9de38",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -16,
+        0
+      ],
+      "id": "d2134e52-c48b-492e-a237-64005d18bb2c",
+      "name": "Weekly Digest Trigger1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Get New Feedback": {
+      "main": [
+        [
+          {
+            "node": "Loop Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Feedback": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Classify Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Feedback": {
+      "main": [
+        [
+          {
+            "node": "Verify Quote & Tags",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Quote & Tags": {
+      "main": [
+        [
+          {
+            "node": "Is Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Valid?": {
+      "main": [
+        [
+          {
+            "node": "Is Critical?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Invalid": {
+      "main": [
+        [
+          {
+            "node": "Notify Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Critical?": {
+      "main": [
+        [
+          {
+            "node": "Notify Critical",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Mark Processed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Processed": {
+      "main": [
+        [
+          {
+            "node": "Loop Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Invalid": {
+      "main": [
+        [
+          {
+            "node": "Loop Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Digest Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Recent Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Recent Feedback": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Trends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Trends": {
+      "main": [
+        [
+          {
+            "node": "Write Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Summary": {
+      "main": [
+        [
+          {
+            "node": "Verify Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Summary": {
+      "main": [
+        [
+          {
+            "node": "Is Summary Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Summary Valid?": {
+      "main": [
+        [
+          {
+            "node": "Format Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Digest Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Digest": {
+      "main": [
+        [
+          {
+            "node": "Send an Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Digest Trigger1": {
+      "main": [
+        [
+          {
+            "node": "Get New Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "7c74caf3-3fff-4080-96bc-03c1b6a08e9e",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "ytqqAo7uGMkuWdn9",
+  "tags": []
+}

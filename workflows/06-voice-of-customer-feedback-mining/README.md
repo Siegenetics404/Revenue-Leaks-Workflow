@@ -75,7 +75,7 @@ Execute Workflow A to classify the seeded batch, confirm critical items (Carlos 
 voc_feedback.feedback_items (
   id, source, customer_name, customer_email, rating,
   raw_text, submitted_at,
-  status,              -- new | processed | flagged_invalid
+  status,              -- new | processed | flagged_invalidd
   sentiment, severity, themes,   -- themes is JSONB: up to 3 tags from the taxonomy
   key_quote, processed_at
 )

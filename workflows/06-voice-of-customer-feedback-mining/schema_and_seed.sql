@@ -54,7 +54,7 @@ CREATE INDEX idx_feedback_severity ON feedback_items (severity);
 
 -- Seed data for local testing — 25 fake feedback rows across
 -- reviews, support tickets, and NPS comments, with a realistic mix
--- of sentiment and severity (including 2 deliberately critical rows
+-- of sentiment and severity (including 2 deliberately critical rowss
 -- to test the real-time alert branch).
 
 INSERT INTO feedback_items (source, customer_name, customer_email, rating, raw_text, submitted_at) VALUES

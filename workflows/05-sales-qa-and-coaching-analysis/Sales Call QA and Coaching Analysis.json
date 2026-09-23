@@ -1,0 +1,703 @@
+{
+  "name": "Sales Call QA and Coaching Analysis",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sales-call-transcript",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        16,
+        -336
+      ],
+      "id": "7acb8d67-4931-4df9-a620-b02060922bf2",
+      "name": "Webhook",
+      "webhookId": "13584053-c2da-4176-b00d-daaf26a0dcab"
+    },
+    {
+      "parameters": {
+        "jsCode": "const turns = $json.body.turns || [];\nconst repTurns = turns.filter(t => t.speaker === 'rep');\n\nconst objectionWords = /price|expensive|competitor|think about it|not sure|budget|later|talk to my|need to check/i;\n\nconst opening = repTurns.slice(0, 3);\nconst closing = repTurns.slice(-3);\nconst objectionTurns = repTurns.filter(t => objectionWords.test(t.text));\n\nconst seen = new Set();\nconst excerpt = [...opening, ...objectionTurns, ...closing]\n  .filter(t => {\n    const key = t.ts + t.text.slice(0, 20);\n    if (seen.has(key)) return false;\n    seen.add(key);\n    return true;\n  })\n  .sort((a, b) => a.ts - b.ts);\n\nconst repText = excerpt.map(t => `[${t.ts}s] ${t.text}`).join('\\n');\nconst fullRepText = repTurns.map(t => `[${t.ts}s] ${t.text}`).join('\\n');\n\nreturn [{\n  json: {\n    call_id: $json.body.call_id,\n    rep_name: $json.body.rep_name,\n    customer_name: $json.body.customer_name,\n    company: $json.body.company,\n    call_date: $json.body.call_date,\n    duration_minutes: $json.body.duration_minutes,\n    rep_excerpt: repText,\n    rep_full_text: fullRepText\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        -336
+      ],
+      "id": "d88d4f0f-a618-47d5-8d28-842c048da52c",
+      "name": "Extract Rep Turns"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sales_qa.calls\n  (call_id, rep_name, customer_name, company, call_date, duration_minutes, rep_transcript, status)\nVALUES\n  ($1, $2, $3, $4, $5, $6, $7, 'pending_scoring')\nON CONFLICT (call_id) DO NOTHING\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ $json.call_id }}, {{ $json.rep_name }}, {{ $json.customer_name }}, {{ $json.company }}, {{ $json.call_date }}, {{ $json.duration_minutes }}, {{ $json.rep_full_text }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        480,
+        -336
+      ],
+      "id": "d8191830-1bf3-49a0-a292-d36585b2be31",
+      "name": "Insert Call Record",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a sales call QA analyst. You score a sales rep's performance based only on the rep's own lines from a call transcript. You never see or judge the customer's words directly, only how the rep responded to them.\n\nScore these five categories, 1-5 each:\n- discovery: did the rep ask real questions about the customer's situation before pitching\n- objection_handling: did the rep address concerns directly instead of deflecting\n- value_framing: did the rep tie what they offer to something the customer actually said they needed\n- next_steps: did the call end with a concrete next step, not a vague \"I'll follow up\"\n- tone: professional, not pushy, not scripted-sounding\n\nRULES:\n- For each category, give a one-sentence coaching_note and one evidence_quote copied EXACTLY, word for word, from the transcript given to you. Never paraphrase the quote. Never invent a quote that isn't in the transcript.\n- If a category has no supporting moment in the transcript, set evidence_quote to null and say so in the coaching_note.\n- Do not grade the customer. Do not invent facts about the deal.\n\nReturn ONLY valid JSON, no markdown fences:\n{\n  \"discovery\": {\"score\": 1-5, \"evidence_quote\": \"...\" or null, \"coaching_note\": \"...\"},\n  \"objection_handling\": {\"score\": 1-5, \"evidence_quote\": \"...\" or null, \"coaching_note\": \"...\"},\n  \"value_framing\": {\"score\": 1-5, \"evidence_quote\": \"...\" or null, \"coaching_note\": \"...\"},\n  \"next_steps\": {\"score\": 1-5, \"evidence_quote\": \"...\" or null, \"coaching_note\": \"...\"},\n  \"tone\": {\"score\": 1-5, \"evidence_quote\": \"...\" or null, \"coaching_note\": \"...\"}\n}"
+            },
+            {
+              "content": "=Rep: {{ $json.rep_name }}\nCall with: {{ $json.customer_name }} at {{ $json.company }}\nDuration: {{ $json.duration_minutes }} minutes\n\nRep's transcript excerpt (opening, objection moments, closing):\n{{ $('Extract Rep Turns').item.json.rep_excerpt }}\n\nScore this call."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        688,
+        -336
+      ],
+      "id": "6d00795d-f862-440e-85a4-4163e80755d6",
+      "name": "Score Call (LLM)",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output?.[0]?.content?.[0]?.text\n  ?? $json.message?.content\n  ?? $json.content\n  ?? \"\";\n\nlet parsed;\ntry {\n  const cleaned = raw\n    .replace(/```json|```/g, \"\")\n    .replace(/,(\\s*[}\\]])/g, \"$1\")  // strip trailing commas before } or ]\n    .trim();\n  parsed = typeof raw === \"string\" ? JSON.parse(cleaned) : raw;\n} catch (e) {\n  return [{ json: { ...$('Extract Rep Turns').item.json, valid: false, fail_reason: \"unparseable\" } }];\n}\n\nconst categories = ['discovery', 'objection_handling', 'value_framing', 'next_steps', 'tone'];\nconst fullText = $('Extract Rep Turns').item.json.rep_full_text.toLowerCase();\nconst failed = [];\n\nfor (const cat of categories) {\n  const entry = parsed[cat];\n  if (!entry || typeof entry.score !== 'number' || entry.score < 1 || entry.score > 5) {\n    failed.push(`${cat}:bad_score`);\n    continue;\n  }\n  if (entry.evidence_quote) {\n    const quoteClean = entry.evidence_quote.toLowerCase().replace(/^\\[\\d+s\\]\\s*/, '').trim();\n    if (quoteClean.length > 8 && !fullText.includes(quoteClean)) {\n      failed.push(`${cat}:quote_not_found`);\n    }\n  }\n}\n\nconst overall = categories.reduce((sum, c) => sum + (parsed[c]?.score || 0), 0) / categories.length;\n\nreturn [{ json: {\n  ...$('Extract Rep Turns').item.json,\n  scores: parsed,\n  overall_score: Math.round(overall * 10) / 10,\n  valid: failed.length === 0,\n  fail_reason: failed.join(\",\")\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        -336
+      ],
+      "id": "0132b24d-3050-4e3e-b616-bc26fae06aaa",
+      "name": "Validate Scores & Quotes"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "065c93fb-6faa-495b-b194-24aa98115af1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1312,
+        -336
+      ],
+      "id": "193fc10a-0bd4-4cb1-9841-15f6005b1f0c",
+      "name": "IF: Valid?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sales_qa.calls\nSET status = 'needs_review', fail_reason = $2\nWHERE call_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $('Validate Scores & Quotes').item.json.call_id }}, {{ $('Validate Scores & Quotes').item.json.fail_reason }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1776,
+        -208
+      ],
+      "id": "0465b6de-e5b7-4282-a1d4-f19ceca269ae",
+      "name": "Update: Needs Review",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sales_qa.calls SET\n  scores = $2,\n  overall_score = $3,\n  status = 'scored',\n  coaching_needed = (\n    $3::numeric < 3.0\n    OR (($2::jsonb->'objection_handling'->>'score')::numeric <= 2)\n    OR (($2::jsonb->'next_steps'->>'score')::numeric <= 2)\n  )\nWHERE call_id = $1\nRETURNING call_id, status, overall_score, coaching_needed, rep_name, scores;",
+        "options": {
+          "queryReplacement": "={{ $json.call_id }}, {{ JSON.stringify($json.scores) }}, {{ $json.overall_score }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1536,
+        -432
+      ],
+      "id": "1748ff8b-3ba4-418f-b271-4405b597e31b",
+      "name": "Update Call Score",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "35344c58-0207-4c82-acf8-13f6bc117430",
+              "leftValue": "={{ $json.coaching_needed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1776,
+        -432
+      ],
+      "id": "4882e0c4-a218-46e4-a218-3ef47d23cba0",
+      "name": "IF: Coaching Needed?"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Coaching flag: {{ $json.rep_name }} — call {{ $json.call_id }} scored {{ $json.overall_score }}/5\n\nWeak spots:\n{{ $json.scores.objection_handling.score <= 2 ? '- Objection handling (' + $json.scores.objection_handling.score + '/5): \"' + $json.scores.objection_handling.evidence_quote + '\"' : '' }}\n{{ $json.scores.next_steps.score <= 2 ? '- Next steps (' + $json.scores.next_steps.score + '/5): \"' + $json.scores.next_steps.evidence_quote + '\"' : '' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2032,
+        -448
+      ],
+      "id": "5f346004-48d9-4f73-a0c4-51eea05a9e27",
+      "name": "Alert: Manager Coaching Flag",
+      "webhookId": "afc7f310-2fa2-4826-bc01-09332daf14e8",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Scoring failed for call {{ $json.call_id }} ({{ $json.rep_name }}) — {{ $json.fail_reason }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1536,
+        -208
+      ],
+      "id": "35886104-ef89-49ad-8651-151ad7300383",
+      "name": "Alert: Scoring Failed",
+      "webhookId": "afc7f310-2fa2-4826-bc01-09332daf14e8",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        16,
+        80
+      ],
+      "id": "f5acd695-501c-4e8d-847f-a020709336e6",
+      "name": "Weekly Digest Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT rep_name, overall_score, scores, call_date\nFROM sales_qa.calls\nWHERE status = 'scored' AND call_date >= CURRENT_DATE - INTERVAL '7 days'\nORDER BY rep_name, call_date;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        256,
+        80
+      ],
+      "id": "0c58f24c-f3c6-41fc-9a8d-a67c186a4ebd",
+      "name": "Pull This Week's Scores",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT rep_name, overall_score, scores, call_date\nFROM sales_qa.calls\nWHERE status = 'scored'\n  AND call_date >= CURRENT_DATE - INTERVAL '14 days'\n  AND call_date < CURRENT_DATE - INTERVAL '7 days'\nORDER BY rep_name, call_date;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        480,
+        80
+      ],
+      "id": "f72d7a48-f657-46fb-912b-ec9376edec38",
+      "name": "Pull Prior Week's Scores",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function groupByRep(rows) {\n  const byRep = {};\n  for (const r of rows) {\n    if (!byRep[r.rep_name]) byRep[r.rep_name] = [];\n    byRep[r.rep_name].push(r);\n  }\n  return byRep;\n}\n\nconst thisWeek = groupByRep($(\"Pull This Week's Scores\").all().map(i => i.json));\nconst lastWeek = groupByRep($(\"Pull Prior Week's Scores\").all().map(i => i.json));\n\nconst categories = ['discovery', 'objection_handling', 'value_framing', 'next_steps', 'tone'];\nconst results = [];\n\nfor (const rep of Object.keys(thisWeek)) {\n  const calls = thisWeek[rep];\n  const avgThis = calls.reduce((s, c) => s + Number(c.overall_score), 0) / calls.length;\n  const priorCalls = lastWeek[rep] || [];\n  const avgLast = priorCalls.length\n    ? priorCalls.reduce((s, c) => s + Number(c.overall_score), 0) / priorCalls.length\n    : null;\n\n  let weakest = null;\n  for (const c of calls) {\n    for (const cat of categories) {\n      const entry = c.scores?.[cat];\n      if (entry?.evidence_quote && (!weakest || entry.score < weakest.score)) {\n        weakest = { category: cat, ...entry };\n      }\n    }\n  }\n\n  results.push({\n    rep_name: rep,\n    calls_this_week: calls.length,\n    avg_this_week: Math.round(avgThis * 10) / 10,\n    avg_last_week: avgLast ? Math.round(avgLast * 10) / 10 : null,\n    trend: avgLast ? Math.round((avgThis - avgLast) * 10) / 10 : null,\n    weakest_moment: weakest\n  });\n}\n\nreturn results.map(r => ({ json: r }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        80
+      ],
+      "id": "c00079e8-d434-4909-9cb9-35d3ff34675e",
+      "name": "Aggregate Rep Stats"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        912,
+        80
+      ],
+      "id": "73e2a3f7-c5ec-4803-80b0-6d56e7b4c725",
+      "name": "Loop Over Reps"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "You write short, specific weekly coaching notes for sales reps, based only on the stats and quote given to you. You never invent a call detail, number, or quote that wasn't provided.\n\nRULES:\n- 3-5 sentences.\n- Open with one genuine specific strength if the trend or scores support one; don't manufacture praise.\n- Name the ONE thing to focus on next week, tied to the weakest_moment category and quote given.\n- No generic advice like \"keep up the good work\" or \"communication is key.\"\n- No em-dashes, no exclamation marks.\n\nReturn ONLY valid JSON, no markdown fences:\n{\"coaching_note\": \"...\"}"
+            },
+            {
+              "content": "=Rep: {{ $json.rep_name }}\nCalls scored this week: {{ $json.calls_this_week }}\nThis week's average: {{ $json.avg_this_week }}/5\nLast week's average: {{ $json.avg_last_week }}/5\nTrend: {{ $json.trend }}\n\nWeakest moment this week ({{ $json.weakest_moment.category }}, scored {{ $json.weakest_moment.score }}/5):\n\"{{ $json.weakest_moment.evidence_quote }}\"\n\nWrite the coaching note."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.4
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1152,
+        96
+      ],
+      "id": "226d0e10-e19e-48c8-831b-d11bb5b2808e",
+      "name": "Draft Coaching Note (LLM)",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output?.[0]?.content?.[0]?.text\n  ?? $json.message?.content\n  ?? $json.content\n  ?? \"\";\n\nlet parsed;\ntry {\n  const cleaned = raw\n    .replace(/```json|```/g, \"\")\n    .replace(/,(\\s*[}\\]])/g, \"$1\")\n    .trim();\n  parsed = typeof raw === \"string\" ? JSON.parse(cleaned) : raw;\n} catch (e) {\n  return [{ json: { ...$('Loop Over Reps').item.json, valid: false, fail_reason: \"unparseable\" } }];\n}\n\nconst note = (parsed.coaching_note || \"\").trim();\nconst wordCount = note.split(/\\s+/).length;\n\nconst checks = {\n  hasNote: note.length > 20,\n  wordCountOk: wordCount <= 120,\n  noAiTells: !/as an AI|I hope this|circling back/i.test(note)\n};\n\nconst failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);\n\nreturn [{ json: {\n  ...$('Loop Over Reps').item.json,\n  coaching_note: note,\n  valid: failed.length === 0,\n  fail_reason: failed.join(\",\")\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1488,
+        96
+      ],
+      "id": "4ab97e78-f620-4e09-8a7f-349ed51695b5",
+      "name": "Guardrail Digest Note"
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nconst trendArrow = r.trend > 0 ? '↑' : r.trend < 0 ? '↓' : '→';\nreturn [{ json: {\n  message: `${r.rep_name} — ${r.avg_this_week}/5 (${trendArrow} ${r.trend ?? 'n/a'})\\n${r.coaching_note}`\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        96
+      ],
+      "id": "a68171da-4047-4deb-af0e-7ea0773308bd",
+      "name": "Format Digest Message"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        240
+      ],
+      "id": "2d1da235-358c-4dbb-b129-88d66de2e325",
+      "name": "Send Coaching Digest",
+      "webhookId": "99e7c4d2-b5d3-4731-bd66-ec2354a15d1c",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Sales QA — Call Scoring\nScores every rep's call against a 5-category rubric using a local AI model, with every score backed by a guardrail-checked quote from the real transcript.",
+        "height": 448,
+        "width": 2304
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        -480
+      ],
+      "id": "54ae3864-1481-4dd2-8fb6-9c94cdd4d6af",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## Sales QA — Coaching Digest\nCompares each rep's scores week over week and sends a short AI coaching note grounded in their weakest real moment.",
+        "height": 464,
+        "width": 1936,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        -16
+      ],
+      "id": "63d8d945-ffea-4477-bb36-65b690a0eb99",
+      "name": "Sticky Note1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Rep Turns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Rep Turns": {
+      "main": [
+        [
+          {
+            "node": "Insert Call Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Call Record": {
+      "main": [
+        [
+          {
+            "node": "Score Call (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Call (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Validate Scores & Quotes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Scores & Quotes": {
+      "main": [
+        [
+          {
+            "node": "IF: Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Valid?": {
+      "main": [
+        [
+          {
+            "node": "Update Call Score",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert: Scoring Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Call Score": {
+      "main": [
+        [
+          {
+            "node": "IF: Coaching Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert: Scoring Failed": {
+      "main": [
+        [
+          {
+            "node": "Update: Needs Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Coaching Needed?": {
+      "main": [
+        [
+          {
+            "node": "Alert: Manager Coaching Flag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Digest Trigger": {
+      "main": [
+        [
+          {
+            "node": "Pull This Week's Scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pull This Week's Scores": {
+      "main": [
+        [
+          {
+            "node": "Pull Prior Week's Scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pull Prior Week's Scores": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Rep Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Rep Stats": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Reps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Reps": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Draft Coaching Note (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Coaching Note (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Guardrail Digest Note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardrail Digest Note": {
+      "main": [
+        [
+          {
+            "node": "Format Digest Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Digest Message": {
+      "main": [
+        [
+          {
+            "node": "Send Coaching Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Coaching Digest": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Reps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "3c8b2adc-5c21-42fb-9973-b7b19ee97ebf",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "8TvRanwvrdTCUJjd",
+  "tags": []
+}

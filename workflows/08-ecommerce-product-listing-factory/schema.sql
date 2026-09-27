@@ -1,0 +1,22 @@
+CREATE TABLE product_intake (
+  id SERIAL PRIMARY KEY,
+  sku TEXT UNIQUE,
+  raw_name TEXT,
+  category TEXT,
+  material TEXT,
+  dimensions TEXT,
+  price NUMERIC,
+  raw_notes TEXT,
+  variant_group TEXT,
+  variant_attrs TEXT,
+  image_url TEXT,
+  status TEXT DEFAULT 'pending',
+  generated_title TEXT,
+  generated_description TEXT,
+  generated_bullets TEXT,
+  generated_seo_meta TEXT,
+  generated_alt_text TEXT,
+  shopify_product_id TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  reviewed_at TIMESTAMP
+);

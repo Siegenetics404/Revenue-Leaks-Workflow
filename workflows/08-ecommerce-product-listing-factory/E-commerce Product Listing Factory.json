@@ -1,0 +1,680 @@
+{
+  "name": "E-commerce Product Listing Factory",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map(i => i.json);\nconst groups = {};\nfor (const item of items) {\n  const key = item.variant_group || item.sku;\n  if (!groups[key]) groups[key] = [];\n  groups[key].push(item);\n}\nreturn Object.entries(groups).map(([key, rows]) => ({\n  json: { variant_group: key, rows }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        0
+      ],
+      "id": "062081b0-f21a-4ce3-911c-1dcf500c40f2",
+      "name": "Group By Variant"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM product_intake\nWHERE status = 'pending'\nORDER BY variant_group, sku\nLIMIT 10;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        208,
+        0
+      ],
+      "id": "ae28d854-c779-4ffb-81c0-108ae728ef5e",
+      "name": "Pull Pending Products",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        624,
+        0
+      ],
+      "id": "39e7b00e-1efd-410a-a7a0-4287f000cd66",
+      "name": "Loop Product Groups"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an e-commerce copywriter. You write clean, honest product listings.\n\nRULES:\n- Use ONLY the facts given to you. Never invent materials, certifications,\n  dimensions, care instructions, or claims not present in the input.\n- Specifically banned unless the word \"eco-friendly,\" \"organic,\" \"sustainable,\"\n  \"certified,\" \"green,\" or \"recycled\" appears in the input materials/notes:\n  do not use ANY of those words, even as a natural-sounding description of\n  cotton, canvas, wood, or other natural materials. A natural material is not\n  automatically \"eco-friendly\" — do not imply this.\n- If a field is missing (e.g. no material given), omit any mention of it —\n  do not guess or generalize.\n- Never include a note about missing or incomplete information in the\n  customer-facing text. If a field is missing, simply omit any mention of\n  it entirely — do not write things like \"not specified,\" \"TBD,\" or repeat\n  any internal note about missing data.\n- Title: under 70 characters, no ALL CAPS, no more than one exclamation point\n  total across the whole output (prefer zero). Do not add a marketing\n  subtitle/tagline after a dash unless it restates a literal fact already\n  given (e.g. the category or a dimension) — no invented taglines.\n- Description: 80-120 words, plain language, no superlatives without a stated\n  reason (\"best\" / \"amazing\" / \"premium\" / \"eco-friendly\" are banned unless\n  the input explicitly supports the claim).\n- 4-6 bullet features, each under 12 words, each stating one concrete fact\n  taken directly from the input.\n- SEO meta description: under 155 characters, includes the product name once.\n- If variants are given, write ONE shared description plus variant-specific\n  bullet differences only — do not repeat the full description per variant.\n- Alt text per image: under 125 characters, literal visual description, no\n  keyword stuffing.\n- Before finalizing, check every adjective in your title and description\n  against the input. If an adjective isn't directly supported, remove it.\n\nReturn ONLY valid JSON, no markdown fences:\n{\n  \"title\": \"...\",\n  \"description\": \"...\",\n  \"bullets\": [\"...\", \"...\"],\n  \"seo_meta\": \"...\",\n  \"variants\": [\n    {\"sku\": \"...\", \"variant_bullets\": [\"...\"], \"alt_text\": \"...\"}\n  ]\n}"
+            },
+            {
+              "content": "=Product group: {{ $json.variant_group }}\n\n{{ $json.rows.map(r => `SKU: ${r.sku}\nName: ${r.raw_name}\nCategory: ${r.category}\nMaterial: ${r.material || \"not provided\"}\nDimensions: ${r.dimensions || \"not provided\"}\nPrice: ${r.price}\nNotes: ${r.raw_notes || \"none\"}\nVariant attributes: ${r.variant_attrs || \"none\"}\n`).join('\\n---\\n') }}\n\nWrite the listing."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        848,
+        16
+      ],
+      "id": "73844797-9b4e-4f4b-bae7-d9ea468b7cd9",
+      "name": "Generate Listing Copy",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.output?.[0]?.content?.[0]?.text ?? \"\";\nlet parsed;\ntry {\n  parsed = JSON.parse(raw.replace(/```json|```/g, \"\").trim());\n} catch (e) {\n  return [{ json: { variant_group: $('Loop Product Groups').item.json.variant_group,\n                     valid: false, fail: \"unparseable\", fail_reason: \"AI response wasn't valid JSON — check LM Studio output.\" } }];\n}\n\nconst rows = $('Loop Product Groups').item.json.rows;\nconst sourceText = rows.map(r => `${r.raw_name} ${r.material || \"\"} ${r.dimensions || \"\"} ${r.raw_notes || \"\"}`)\n  .join(\" \").toLowerCase();\n\nconst desc = (parsed.description || \"\").trim();\nconst title = (parsed.title || \"\").trim();\nconst bulletsText = (parsed.bullets || []).join(\" \");\nconst words = desc.split(/\\s+/).length;\n\nconst bannedClaims = /certified|organic|eco-friendly|handmade|guaranteed for life|clinically|patented/i;\nconst bannedSuperlatives = /\\b(best|amazing|premium|luxurious|revolutionary|stylish|sleek|modern|elegant|chic|trendy)\\b/i;\n\nconst variantValues = new Set();\nif (rows.length > 1) {\n  rows.forEach(r => {\n    (r.variant_attrs || \"\").split(\",\").forEach(pair => {\n      const val = pair.split(\":\")[1];\n      if (val) variantValues.add(val.trim().toLowerCase());\n    });\n  });\n}\nconst sharedText = `${title} ${desc}`.toLowerCase();\nconst leakedValue = [...variantValues].find(v => v && new RegExp(`\\\\b${v}\\\\b`, \"i\").test(sharedText));\n\nconst numberClaims = [...desc.matchAll(/\\b(\\d+)\\s*(hour|hr|day|year|degree|lb|pound|oz|ounce|watt|volt)/gi)];\nconst sourceNumberUnitPairs = new Set(\n  [...sourceText.matchAll(/\\b(\\d+)\\s*(hour|hr|day|year|degree|lb|pound|oz|ounce|watt|volt)/gi)]\n    .map(m => `${m[1]}${m[2].toLowerCase()}`)\n);\nconst fabricatedNumber = numberClaims.find(m => !sourceNumberUnitPairs.has(`${m[1]}${m[2].toLowerCase()}`));\n\nconst internalLeakPhrases = /\\b(no|not)\\b.{0,15}\\bspecified\\b|not provided|\\btbd\\b|to be determined|not available yet|\\bunknown\\b|pending (full )?spec/i;\nconst leakedInternalNote = internalLeakPhrases.test(desc) || internalLeakPhrases.test(title) || internalLeakPhrases.test(bulletsText);\n\n// Catch the model treating a SKU like a brand name (e.g. \"Canvas Backpack by BACK-CNV-01\").\n// A SKU appearing anywhere in customer-facing text is never something a customer should see.\nconst skuList = rows.map(r => r.sku).filter(Boolean);\nconst leakedSku = skuList.find(sku => sharedText.includes(sku.toLowerCase()) || bulletsText.toLowerCase().includes(sku.toLowerCase()));\n\nconst checks = {\n  hasTitle:          title.length > 5 && title.length <= 70,\n  hasDescription:    words >= 15 && words <= 140,\n  bulletCount:       Array.isArray(parsed.bullets) && parsed.bullets.length >= 3 && parsed.bullets.length <= 6,\n  seoMetaLength:      (parsed.seo_meta || \"\").length > 0 && parsed.seo_meta.length <= 155,\n  noUnsourcedClaim:   !bannedClaims.test(desc) || bannedClaims.test(sourceText),\n  noUnsourcedClaimTitle: !bannedClaims.test(title) || bannedClaims.test(sourceText),\n  noBareSuperlative:  !bannedSuperlatives.test(desc) && !bannedSuperlatives.test(title),\n  variantsMatch:      (parsed.variants || []).length === rows.length,\n  noVariantLeak:      !leakedValue,\n  noFabricatedNumber: !fabricatedNumber,\n  noInternalLeak:     !leakedInternalNote,\n  noSkuLeak:          !leakedSku\n};\n\nconst failed = Object.entries(checks).filter(([,v]) => !v).map(([k]) => k);\n\nconst reasons = {\n  hasTitle: \"Title is missing or too long.\",\n  hasDescription: \"Description is the wrong length.\",\n  bulletCount: \"Wrong number of bullet points.\",\n  seoMetaLength: \"SEO meta text is missing or too long.\",\n  noUnsourcedClaim: 'AI added a claim not backed by your product data (like \"eco-friendly\" or \"certified\") in the description.',\n  noUnsourcedClaimTitle: 'AI added a claim not backed by your product data (like \"eco-friendly\" or \"certified\") in the title.',\n  noBareSuperlative: 'Title or description uses a vague marketing word (like \"stylish\" or \"premium\") without support.',\n  variantsMatch: \"AI didn't write copy for every variant in the group.\",\n  noVariantLeak: `Shared title/description mentions a variant-specific detail (\"${leakedValue}\") that doesn't apply to every variant in the group.`,\n  noFabricatedNumber: `AI invented a specific number/spec (\"${fabricatedNumber ? fabricatedNumber[0] : ''}\") not present in your source data.`,\n  noInternalLeak: \"Customer-facing copy mentions missing/incomplete data (an internal note leaked into the listing) — this needs to read naturally without it.\",\n  noSkuLeak: `AI treated the SKU (\"${leakedSku}\") like a brand name and included it in customer-facing text.`\n};\nconst fail_reason = failed.length === 0 ? \"\" : failed.map(k => reasons[k] || k).join(\" \");\n\nreturn [{ json: {\n  variant_group: $('Loop Product Groups').item.json.variant_group,\n  rows,\n  parsed,\n  valid: failed.length === 0,\n  fail: failed.join(\",\"),\n  fail_reason\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        16
+      ],
+      "id": "ded0466f-d647-458f-be2b-f7a5762acdec",
+      "name": "Validate Listing"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f91db0bd-9483-4652-be2c-d097b17e2046",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1344,
+        16
+      ],
+      "id": "d255e453-bfa8-4d51-811f-1dea572e1c2b",
+      "name": "Listing Valid?"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Listing failed for {{ $json.variant_group }}\n\n{{ $json.fail_reason }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1568,
+        80
+      ],
+      "id": "7a8c48c7-1ab9-496c-8ac8-3e42745221b9",
+      "name": "Flag Failed Listing",
+      "webhookId": "104fd93f-89a3-4fae-adcb-c29feb0d71fb",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE product_intake SET status = 'flagged'\nWHERE sku IN ({{ $('Validate Listing').item.json.rows.map(r => `'${r.sku}'`).join(',') }});",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1728,
+        80
+      ],
+      "id": "22b0676e-f2ce-4606-b1a1-36c267d8f258",
+      "name": "Mark Flagged",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE product_intake SET\n  generated_title = $1,\n  generated_description = $2,\n  generated_bullets = $3,\n  generated_seo_meta = $4,\n  generated_alt_text = $5,\n  status = 'drafted'\nWHERE sku = $6;",
+        "options": {
+          "queryReplacement": "={{ [$json.parsed.title, $json.parsed.description, JSON.stringify($json.parsed.bullets), $json.parsed.seo_meta, $json.parsed.variants[0].alt_text, $json.rows[0].sku] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1568,
+        -128
+      ],
+      "id": "0949ea38-0e63-4eeb-996e-b10694850606",
+      "name": "Save Draft",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=New listing draft: {{ $('Validate Listing').item.json.parsed.title }}  {{ $('Validate Listing').item.json.parsed.description }}  Reply \"approve {{ $('Validate Listing').item.json.variant_group }}\" to publish, or \"reject {{ $('Validate Listing').item.json.variant_group }} <reason>\" to send back.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1728,
+        -128
+      ],
+      "id": "41185606-8ffd-43d3-aaeb-86f0a22e6a61",
+      "name": "Request Approval",
+      "webhookId": "11929d16-e48f-4161-8b3b-c8a7d91cb3b9",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {}
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        16,
+        0
+      ],
+      "id": "a8fc3073-fc07-45a6-bc3e-a7d7ac9fc31c",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "const text = $json.message?.text || \"\";\nconst approveMatch = text.match(/^approve\\s+(\\S+)/i);\nconst rejectMatch = text.match(/^reject\\s+(\\S+)\\s*(.*)/i);\n\nif (approveMatch) {\n  return [{ json: { action: \"approve\", variant_group: approveMatch[1] } }];\n}\nif (rejectMatch) {\n  return [{ json: { action: \"reject\", variant_group: rejectMatch[1], reason: rejectMatch[2] } }];\n}\nreturn [{ json: { action: \"ignore\" } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        544
+      ],
+      "id": "3fd37249-c23d-4594-a897-843ef16e29f9",
+      "name": "Parse Approval Command"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM product_intake WHERE variant_group = $1 OR sku = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.variant_group }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        448
+      ],
+      "id": "777d0cac-f87b-46b2-80ea-1de6e3962b48",
+      "name": "Pull Approved Group",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "approve",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "9748ee9b-662e-4714-944d-6c8a8eaba499"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "d598789a-013e-445e-947b-2d4395ec09bd",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "reject",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": 1
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        368,
+        544
+      ],
+      "id": "347dd799-c9b5-41ee-879c-756b6975a01f",
+      "name": "Approve Or Reject?"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.5,
+      "position": [
+        16,
+        544
+      ],
+      "id": "470900ba-42e3-422d-aeea-86298911cf1c",
+      "name": "Listen For Approval Reply",
+      "webhookId": "8548b047-0a49-459c-b7d5-c5d59d37a990",
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://theme-development-vjgegdej.myshopify.com/admin/api/2024-10/products.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"product\": {\n    \"title\": \"{{ $json.generated_title }}\",\n    \"body_html\": \"{{ $json.generated_description }}<ul>{{ $json.generated_bullets ? JSON.parse($json.generated_bullets).map(b => `<li>${b}</li>`).join('') : '' }}</ul>\",\n    \"status\": \"draft\",\n    \"variants\": [\n      { \"sku\": \"{{ $json.sku }}\", \"price\": \"{{ $json.price }}\" }\n    ]\n  }\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        768,
+        448
+      ],
+      "id": "69f518df-3b12-4d6d-84b6-5d52e68ae70c",
+      "name": "Publish To Shopify",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "DH8PukySZGxt8UwW",
+          "name": "Shopify Listing Factory API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE product_intake SET\n  status = 'published',\n  shopify_product_id = $1\nWHERE sku = $2;",
+        "options": {
+          "queryReplacement": "={{ [$json.product.id.toString(), $('Pull Approved Group').item.json.sku] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        976,
+        448
+      ],
+      "id": "dd0a9bf2-e080-42e6-9d12-0446eb709ad8",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE product_intake SET\n  status = 'pending',\n  raw_notes = raw_notes || ' | rejected: ' || $1\nWHERE variant_group = $2 OR sku = $2;",
+        "options": {
+          "queryReplacement": "={{ [$json.reason || 'no reason given', $json.variant_group] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        640
+      ],
+      "id": "d354b35e-78cd-43b7-8415-10ba183452dd",
+      "name": "Reset Rejected Item",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Listing Factory - Generation\nDrafts AI-written product listings from raw data and validates them against fabricated claims before saving for approval.",
+        "height": 560,
+        "width": 1952
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -256
+      ],
+      "id": "3174f955-0c68-48d7-9a5e-309fe697a9d8",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## Listing Factory - Approval\nListens for your approve/reject reply and publishes approved listings to Shopify as drafts.",
+        "height": 464,
+        "width": 1232,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        352
+      ],
+      "id": "7ffece71-433d-4d53-826c-79d244328de4",
+      "name": "Sticky Note1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Pull Pending Products": {
+      "main": [
+        [
+          {
+            "node": "Group By Variant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group By Variant": {
+      "main": [
+        [
+          {
+            "node": "Loop Product Groups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Product Groups": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Generate Listing Copy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Listing Copy": {
+      "main": [
+        [
+          {
+            "node": "Validate Listing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Listing": {
+      "main": [
+        [
+          {
+            "node": "Listing Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Listing Valid?": {
+      "main": [
+        [
+          {
+            "node": "Save Draft",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Failed Listing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Failed Listing": {
+      "main": [
+        [
+          {
+            "node": "Mark Flagged",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Draft": {
+      "main": [
+        [
+          {
+            "node": "Request Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Approval": {
+      "main": [
+        [
+          {
+            "node": "Loop Product Groups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Flagged": {
+      "main": [
+        [
+          {
+            "node": "Loop Product Groups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Pull Pending Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Approval Command": {
+      "main": [
+        [
+          {
+            "node": "Approve Or Reject?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pull Approved Group": {
+      "main": [
+        [
+          {
+            "node": "Publish To Shopify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approve Or Reject?": {
+      "main": [
+        [
+          {
+            "node": "Pull Approved Group",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reset Rejected Item",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Listen For Approval Reply": {
+      "main": [
+        [
+          {
+            "node": "Parse Approval Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish To Shopify": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "98c0b6c4-610c-4300-900b-4e387d6dbc1e",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "KBHUyAgVtmPnsyYf",
+  "tags": []
+}

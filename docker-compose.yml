@@ -10,6 +10,7 @@ services:
       - N8N_SECURE_COOKIE=false
       - GENERIC_TIMEZONE=Asia/Manila
       - WEBHOOK_URL=${WEBHOOK_URL}
+      - NODE_OPTIONS=--dns-result-order=ipv4first --no-network-family-autoselection
     volumes:
       - n8n_data:/home/node/.n8n
 

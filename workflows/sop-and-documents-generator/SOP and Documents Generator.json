@@ -1,0 +1,1322 @@
+{
+  "name": "SOP and Documents Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.5,
+      "position": [
+        -240,
+        0
+      ],
+      "id": "c4b0adc9-0cfd-4f58-85fa-9ce396a847c7",
+      "name": "Receive SOP Notes",
+      "webhookId": "de7e3260-72a7-4ef3-9a21-485c2df189b8",
+      "executeOnce": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $input.first().json.message;\nconst text = (msg.text || '').replace(/\\\\n/g, '\\n');\nconst lines = text.split('\\n');\n\nconst titleLine = lines.find(l => l.trim().toUpperCase().startsWith('TITLE:'));\nconst title = titleLine\n  ? titleLine.replace(/TITLE:/i, '').trim()\n  : 'Untitled SOP';\nconst body = lines.filter(l => l !== titleLine).join('\\n').trim();\n\nreturn [{\n  json: {\n    title,\n    raw_input: body,\n    submitted_by: msg.from.username || String(msg.from.id),\n    chat_id: msg.chat.id\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        144,
+        -112
+      ],
+      "id": "8bb8e36e-6f17-4442-9053-fb34fbf0da39",
+      "name": "Parse Title and Body"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM sop_documents WHERE title = $1;",
+        "options": {
+          "queryReplacement": "={{ $('Parse Title and Body').item.json.title }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        336,
+        -112
+      ],
+      "id": "75057ead-17ac-47f7-8e8c-811331416241",
+      "name": "Check Existing SOP",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ee6bf02e-d239-406a-9a68-da5a44178aad",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        528,
+        -112
+      ],
+      "id": "1f6dbb35-32ac-4988-aaa6-ef8bf194e260",
+      "name": "Is Existing SOP?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sop_documents (title, requested_by, status)\nVALUES ($1, $2, 'draft')\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Parse Title and Body').item.json.title, $('Parse Title and Body').item.json.submitted_by ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        736,
+        0
+      ],
+      "id": "ff8fc7af-ace5-4668-a526-608e6bab9835",
+      "name": "Create SOP Document",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "9828f0a6-1565-4643-b576-b247857ef642",
+              "name": "document_id",
+              "value": "={{ $json.id }}",
+              "type": "number"
+            },
+            {
+              "id": "95c25623-3700-4525-aa30-a7837e49600e",
+              "name": "title",
+              "value": "={{ $('Parse Title and Body').first().json.title }}",
+              "type": "string"
+            },
+            {
+              "id": "fe9117e3-70ec-496f-a84d-8103790117f7",
+              "name": "raw_input",
+              "value": "={{ $('Parse Title and Body').first().json.raw_input }}",
+              "type": "string"
+            },
+            {
+              "id": "20db6c58-17be-4dc3-994e-82a186b0dd77",
+              "name": "submitted_by",
+              "value": "={{ $('Parse Title and Body').first().json.submitted_by }}",
+              "type": "string"
+            },
+            {
+              "id": "20a869ef-2c44-442f-8833-a8fee2c133c6",
+              "name": "chat_id",
+              "value": "={{ $('Parse Title and Body').first().json.chat_id }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        928,
+        -128
+      ],
+      "id": "b5d247f9-1013-461d-98d9-7f50f46e1f02",
+      "name": "Set Document ID"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_version\nFROM sop_versions\nWHERE document_id = $1;",
+        "options": {
+          "queryReplacement": "={{ [ $json.document_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1136,
+        -128
+      ],
+      "id": "23033fef-f246-4689-afb1-d08a58cb65b0",
+      "name": "Get Next Version",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Set Document ID').first().json;\nconst version = $('Get Next Version').first().json.next_version;\nconst input = $input.first().json;\n\nconst raw = input.output?.[0]?.content?.[0]?.text\n  ?? input.message?.content\n  ?? input.content\n  ?? \"\";\n\nlet sop;\ntry {\n  sop = typeof raw === \"string\"\n    ? JSON.parse(raw.replace(/```json|```/g, \"\").trim())\n    : raw;\n} catch (e) {\n  return [{ json: {\n    ...ctx,\n    version_number: version,\n    sop: null,\n    valid: false,\n    completeness_score: 0,\n    missing_fields: \"unparseable_output\"\n  }}];\n}\n\nconst steps = Array.isArray(sop.steps) ? sop.steps : [];\n\nconst checks = {\n  hasPurpose:        (sop.purpose || \"\").length > 10,\n  hasRoles:          Array.isArray(sop.roles) && sop.roles.length > 0,\n  hasTools:          Array.isArray(sop.tools) && sop.tools.length > 0,\n  enoughSteps:       steps.length >= 3,\n  stepsHaveActor:    steps.length > 0 && steps.every(s => s.actor && s.actor.length > 0),\n  stepsOrdered:      steps.length > 0 && steps.every((s, i) => s.order === i + 1),\n  exceptionsPresent: Array.isArray(sop.exceptions)\n};\n\nconst failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);\nconst score = Math.round(100 * (Object.keys(checks).length - failed.length) / Object.keys(checks).length);\n\nreturn [{ json: {\n  ...ctx,\n  version_number: version,\n  sop,\n  completeness_score: score,\n  missing_fields: failed.join(\", \"),\n  valid: score >= 80\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1648,
+        -128
+      ],
+      "id": "459e3d2c-2070-4014-bd5e-e6bf82612623",
+      "name": "Validate SOP"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "0a2596b2-d5f4-4cf2-9294-3e9db61fba71",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1856,
+        -128
+      ],
+      "id": "46b0d589-31cd-4726-a194-4bb0b12e50b1",
+      "name": "Is SOP Complete?"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "=Draft for \"{{ $json.title }}\" needs more detail before it can be saved.\n\nMissing: {{ $json.missing_fields }}\nCompleteness: {{ $json.completeness_score }}/100\n\nResubmit with the same TITLE line and add the missing specifics.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2080,
+        -32
+      ],
+      "id": "fb5add36-cbf6-42e1-91e5-706d3ee9797b",
+      "name": "Ask For Missing Details",
+      "webhookId": "3caefd8d-072c-4e4d-881b-c6d1d847d11e",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst s = d.sop;\n\nconst clean = (arr) => (Array.isArray(arr) ? arr : [])\n  .map(x => String(x ?? '').trim())\n  .filter(Boolean);\n\nconst cap = (t) => String(t ?? '')\n  .replace(/\\b\\w/g, c => c.toUpperCase());\n\nconst tidy = (t) => String(t ?? '').trim().replace(/\\.$/, '');\nconst cap1 = (t) => { t = tidy(t); return t.charAt(0).toUpperCase() + t.slice(1); };\n\nconst roles = clean(s.roles).map(cap);\nconst tools = clean(s.tools);\nconst prerequisites = clean(s.prerequisites);\nconst exceptions = clean(s.exceptions);\nconst warnings = clean(s.warnings);\n\nlet md = `# ${d.title}\\n\\n`;\nmd += `**Purpose:** ${s.purpose}\\n\\n`;\nmd += `**Roles involved:** ${roles.join(', ')}\\n\\n`;\nmd += `**Tools and systems:** ${tools.join(', ')}\\n\\n`;\n\nif (prerequisites.length) {\n  md += `## Prerequisites\\n` + prerequisites.map(p => `- ${p}`).join('\\n') + '\\n\\n';\n}\n\nmd += `## Steps\\n`;\nmd += s.steps.map(st => {\n  const action = cap1(st.action);\n  const showTool = st.tool && !action.toLowerCase().includes(String(st.tool).toLowerCase());\n  return `${st.order}. ${cap(st.actor)}: ${action}${showTool ? ` (via ${st.tool})` : ''}.`;\n}).join('\\n') + '\\n\\n';\n\nif (exceptions.length) {\n  md += `## Exceptions\\n` + exceptions.map(e => `- ${e}`).join('\\n') + '\\n\\n';\n}\nif (warnings.length) {\n  md += `## Warnings\\n` + warnings.map(w => `- ⚠️ ${w}`).join('\\n') + '\\n\\n';\n}\n\nmd += `---\\n*Version ${d.version_number} · Completeness ${d.completeness_score}/100*`;\n\nreturn [{ json: { ...d, rendered_markdown: md } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2064,
+        -240
+      ],
+      "id": "54fd46f8-348e-440c-bd48-e90686732a08",
+      "name": "Render SOP Markdown"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sop_versions\n  (document_id, version_number, raw_input, structured_json, rendered_markdown, completeness_score, missing_fields)\nVALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)\nRETURNING id, document_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.document_id, $json.version_number, $json.raw_input, JSON.stringify($json.sop), $json.rendered_markdown, $json.completeness_score, $json.missing_fields ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2256,
+        -240
+      ],
+      "id": "61864f21-41be-4883-93d0-caba4f2c4f82",
+      "name": "Save SOP Version",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sop_documents\nSET status = 'in_review', current_version_id = $1\nWHERE id = $2\nRETURNING id, status, current_version_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.id, $json.document_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2448,
+        -240
+      ],
+      "id": "7ecbc72c-38c4-446a-aa13-8661822828b1",
+      "name": "Mark In Review",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Render SOP Markdown').first().json.chat_id }}",
+        "text": "={{ $('Render SOP Markdown').first().json.rendered_markdown }}\n\nReply APPROVE to publish, REVISE: <your feedback> to send it back for a rewrite, or REJECT to archive it.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2640,
+        -240
+      ],
+      "id": "f92f15d0-df31-468f-bcfd-ca793e59884f",
+      "name": "Send SOP For Review",
+      "webhookId": "3caefd8d-072c-4e4d-881b-c6d1d847d11e",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "8de512be-4ccb-4f6d-9c8a-e929049415ff",
+              "leftValue": "={{ $json.message.text }}",
+              "rightValue": "TITLE:",
+              "operator": {
+                "type": "string",
+                "operation": "startsWith"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "ignoreCase": true
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -64,
+        0
+      ],
+      "id": "dfb28934-0817-4057-abd8-38c534ef0ac3",
+      "name": "Is New Submission?"
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $input.first().json.message;\nconst text = (msg.text || '').trim();\nconst REVIEWER_CHAT_ID = 5611798761;\n\nlet decision = null;\nlet feedback = '';\n\nif (/^approve\\b/i.test(text)) {\n  decision = 'approved';\n} else if (/^reject\\b/i.test(text)) {\n  decision = 'rejected';\n} else if (/^revise\\s*:/i.test(text)) {\n  decision = 'revision_requested';\n  feedback = text.replace(/^revise\\s*:/i, '').trim();\n}\n\nreturn [{\n  json: {\n    raw_reply: text,\n    decision,\n    feedback,\n    chat_id: msg.chat.id,\n    reviewer: msg.from.username || String(msg.from.id),\n    is_reviewer: msg.chat.id === REVIEWER_CHAT_ID\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        144,
+        144
+      ],
+      "id": "275081fc-3ded-44ea-a22c-233df1f97097",
+      "name": "Parse Reviewer Decision"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT sv.id AS version_id,\n       sv.document_id,\n       sv.version_number,\n       sd.title,\n       sv.raw_input,\n       sv.structured_json,\n       sv.rendered_markdown\nFROM sop_versions sv\nJOIN sop_documents sd ON sd.id = sv.document_id\nWHERE sd.status = 'in_review'\n  AND sv.id = sd.current_version_id\nORDER BY sv.created_at DESC\nLIMIT 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        336,
+        144
+      ],
+      "id": "f8b3f05f-3156-4fa1-ab16-b29de4abc26b",
+      "name": "Get Pending Version",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Parse Reviewer Decision').first().json.decision }}",
+                    "rightValue": "approved",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "80a6df58-ca28-4cbd-a0ab-c3c5cb1470d3"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Approved"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "2cb6a3f5-68be-4b4f-bfc8-606a1fc7067a",
+                    "leftValue": "={{ $('Parse Reviewer Decision').first().json.decision }}",
+                    "rightValue": "rejected",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Rejected"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "4ac32ca2-8246-41d3-9000-7764e27227b3",
+                    "leftValue": "={{ $('Parse Reviewer Decision').first().json.decision }}",
+                    "rightValue": "revision_requested",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Revise"
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Unclear"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        528,
+        448
+      ],
+      "id": "dabfe24c-66b5-4349-8219-18601f534236",
+      "name": "Route Decision"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH log AS (\n  INSERT INTO sop_reviews (version_id, reviewer, decision, feedback)\n  VALUES ($1, $3, 'approved', '')\n  RETURNING id\n)\nUPDATE sop_documents\nSET status = 'approved'\nWHERE id = $2\nRETURNING id, title, status, current_version_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.version_id, $json.document_id, $('Parse Reviewer Decision').first().json.reviewer ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        848,
+        240
+      ],
+      "id": "3794c4b9-728d-4483-8345-cc7a590e22b3",
+      "name": "Approve Document",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH log AS (\n  INSERT INTO sop_reviews (version_id, reviewer, decision, feedback)\n  VALUES ($1, $3, 'rejected', '')\n  RETURNING id\n)\nUPDATE sop_documents\nSET status = 'archived'\nWHERE id = $2\nRETURNING id, title, status;",
+        "options": {
+          "queryReplacement": "={{ [ $json.version_id, $json.document_id, $('Parse Reviewer Decision').first().json.reviewer ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        848,
+        400
+      ],
+      "id": "5261d87c-e6d6-4ece-a569-47acbec78a89",
+      "name": "Reject Document",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Reviewer Decision').first().json.chat_id }}",
+        "text": "=Rejected: \"{{ $('Reject Document').first().json.title }}\" (version {{ $('Get Pending Version').first().json.version_number }}) has been archived.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1056,
+        400
+      ],
+      "id": "2a898961-19f8-4a1b-9d62-b33ba3cb51f4",
+      "name": "Confirm Rejection",
+      "webhookId": "3caefd8d-072c-4e4d-881b-c6d1d847d11e",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Reviewer Decision').first().json.chat_id }}",
+        "text": "=Approved: \"{{ $('Approve Document').first().json.title }}\" (version {{ $('Get Pending Version').first().json.version_number }}) is now the official SOP.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1056,
+        240
+      ],
+      "id": "8818a924-e4bd-4c9f-8610-2c4ed84e522e",
+      "name": "Confirm Approval",
+      "webhookId": "3caefd8d-072c-4e4d-881b-c6d1d847d11e",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sop_reviews (version_id, reviewer, decision, feedback)\nVALUES ($1, $2, 'revision_requested', $3)\nRETURNING id, version_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.version_id, $('Parse Reviewer Decision').first().json.reviewer, $('Parse Reviewer Decision').first().json.feedback ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        848,
+        576
+      ],
+      "id": "0e0fe3c6-2230-4f7c-9fa2-d91164b94055",
+      "name": "Log Revision Request",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are revising an SOP based on reviewer feedback. Keep everything from the previous version that the feedback does not address. Apply the feedback exactly. Never invent tools, roles, or facts that are not in the original notes or the feedback itself.\n\nReturn ONLY valid JSON with the same schema as the previous SOP, no markdown fences:\n{\n  \"purpose\": \"one sentence\",\n  \"roles\": [\"role names\"],\n  \"tools\": [\"tools named in the source\"],\n  \"prerequisites\": [\"conditions before starting\"],\n  \"steps\": [\n    {\"order\": 1, \"actor\": \"role\", \"action\": \"imperative instruction\", \"tool\": \"tool used or null\"}\n  ],\n  \"exceptions\": [\"edge cases, or empty array\"],\n  \"warnings\": [\"cautions, or empty array\"]\n}\n\nIf steps are split, added, or removed, renumber \"order\" so it runs 1, 2, 3 without gaps."
+            },
+            {
+              "content": "=Previous SOP:\n{{ JSON.stringify($('Get Pending Version').first().json.structured_json) }}\n\nOriginal raw notes:\n{{ $('Get Pending Version').first().json.raw_input }}\n\nReviewer feedback:\n{{ $('Parse Reviewer Decision').first().json.feedback }}\n\nReturn the revised SOP as JSON."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1056,
+        576
+      ],
+      "id": "a4480f79-1b0b-4c33-8a0b-d8b649ed6994",
+      "name": "Regenerate SOP",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You convert messy raw process notes into a structured SOP. Extract only what is explicitly stated or clearly implied. Never invent a tool, role, or step that isn't in the source text.\n\nReturn ONLY valid JSON, no markdown fences:\n{\n  \"purpose\": \"one sentence, what this SOP accomplishes\",\n  \"roles\": [\"role names involved\"],\n  \"tools\": [\"specific tools/systems named in the source\"],\n  \"prerequisites\": [\"conditions that must be true before starting\"],\n  \"steps\": [\n    {\"order\": 1, \"actor\": \"role\", \"action\": \"imperative instruction\", \"tool\": \"tool used or null\"}\n  ],\n  \"exceptions\": [\"known edge cases or error handling mentioned, or empty array\"],\n  \"warnings\": [\"explicit cautions in the source, or empty array\"]\n}"
+            },
+            {
+              "content": "=Raw notes:\n{{ $('Set Document ID').first().json.raw_input }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1328,
+        -128
+      ],
+      "id": "a9b5b3da-75b6-49cb-b949-dff0f10106f8",
+      "name": "Extract SOP Structure",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const pending = $('Get Pending Version').first().json;\nconst decision = $('Parse Reviewer Decision').first().json;\nconst input = $input.first().json;\n\nconst raw = input.output?.[0]?.content?.[0]?.text\n  ?? input.message?.content\n  ?? input.content\n  ?? \"\";\n\nconst base = {\n  document_id: pending.document_id,\n  title: pending.title,\n  raw_input: pending.raw_input,\n  submitted_by: decision.reviewer,\n  chat_id: decision.chat_id,\n  version_number: pending.version_number + 1\n};\n\nlet sop;\ntry {\n  sop = typeof raw === \"string\"\n    ? JSON.parse(raw.replace(/```json|```/g, \"\").trim())\n    : raw;\n} catch (e) {\n  return [{ json: {\n    ...base,\n    sop: null,\n    valid: false,\n    completeness_score: 0,\n    missing_fields: \"unparseable_output\"\n  }}];\n}\n\nif (!Array.isArray(sop.prerequisites)) {\n  sop.prerequisites = pending.structured_json?.prerequisites ?? [];\n}\n\nconst steps = Array.isArray(sop.steps) ? sop.steps : [];\n\nconst checks = {\n  hasPurpose:        (sop.purpose || \"\").length > 10,\n  hasRoles:          Array.isArray(sop.roles) && sop.roles.length > 0,\n  hasTools:          Array.isArray(sop.tools) && sop.tools.length > 0,\n  enoughSteps:       steps.length >= 3,\n  stepsHaveActor:    steps.length > 0 && steps.every(s => s.actor && s.actor.length > 0),\n  stepsOrdered:      steps.length > 0 && steps.every((s, i) => s.order === i + 1),\n  exceptionsPresent: Array.isArray(sop.exceptions)\n};\n\nconst failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);\nconst score = Math.round(100 * (Object.keys(checks).length - failed.length) / Object.keys(checks).length);\n\nreturn [{ json: {\n  ...base,\n  sop,\n  completeness_score: score,\n  missing_fields: failed.join(\", \"),\n  valid: score >= 80\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1376,
+        576
+      ],
+      "id": "1be5f921-111d-405a-b676-bb9b0101da01",
+      "name": "Validate Revision"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Classify this reviewer reply about a draft document into exactly one category.\n\nCategories:\nAPPROVED - clearly agrees, says it's good, tells you to publish or ship it\nREJECTED - clearly declines, says to drop it or start over\nREVISION_REQUESTED - gives feedback or asks for a change, even without saying \"revise\"\nUNCLEAR - doesn't fit any of the above, or is unrelated to the document\n\nReturn ONLY valid JSON, no markdown fences:\n{\"decision\":\"APPROVED|REJECTED|REVISION_REQUESTED|UNCLEAR\", \"feedback\":\"the feedback text if any, else empty string\"}"
+            },
+            {
+              "content": "=Reviewer reply: {{ $('Parse Reviewer Decision').first().json.raw_reply }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "topP": 0
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        848,
+        752
+      ],
+      "id": "ce7ae2b1-1e13-42a9-8656-6b570772cab1",
+      "name": "Classify Reviewer Reply",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const pending = $('Get Pending Version').first().json;\nconst input = $input.first().json;\n\nconst raw = input.output?.[0]?.content?.[0]?.text\n  ?? input.message?.content\n  ?? input.content\n  ?? \"\";\n\nlet parsed;\ntry {\n  parsed = typeof raw === \"string\"\n    ? JSON.parse(raw.replace(/```json|```/g, \"\").trim())\n    : raw;\n} catch (e) {\n  parsed = { decision: \"UNCLEAR\", feedback: \"\" };\n}\n\nconst decisionMap = {\n  APPROVED: \"approved\",\n  REJECTED: \"rejected\",\n  REVISION_REQUESTED: \"revision_requested\",\n  UNCLEAR: \"unclear\"\n};\n\nreturn [{\n  json: {\n    ...pending,\n    decision: decisionMap[parsed.decision] || \"unclear\",\n    feedback: parsed.feedback || \"\"\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        752
+      ],
+      "id": "5ff9fda9-b1cf-456b-91ac-121d845eddd3",
+      "name": "Route Classified Decision"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.decision }}",
+                    "rightValue": "approved",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "3f062816-17f5-41cf-902e-fd152ea9df26"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Approved"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "340d4305-5834-41fe-a0f5-507973466a15",
+                    "leftValue": "={{ $json.decision }}",
+                    "rightValue": "rejected",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Rejected"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a3b1f44f-fa37-4bc9-a9c3-a0c31d0855d0",
+                    "leftValue": "={{ $json.decision }}",
+                    "rightValue": "revision_requested",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Revise"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Unclear"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1376,
+        720
+      ],
+      "id": "3138ac6e-7e58-45cb-b72d-1a316e04139e",
+      "name": "Route Classified Output"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Didn't catch that. Reply APPROVE, REVISE: <your feedback>, or REJECT.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1616,
+        800
+      ],
+      "id": "78a8d75b-4d4a-4ebb-8dc9-16c65d8584c5",
+      "name": "Ask For Clarification",
+      "webhookId": "3caefd8d-072c-4e4d-881b-c6d1d847d11e",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const pending = $('Get Pending Version').first().json;\nconst doc = $('Approve Document').first().json;\n\nconst slug = doc.title\n  .toLowerCase()\n  .replace(/[^a-z0-9]+/g, '-')\n  .replace(/(^-|-$)/g, '');\n\nconst filename = `${slug}-v${pending.version_number}.md`;\nconst content = pending.rendered_markdown;\n\nreturn [{\n  json: { filename, title: doc.title, version_number: pending.version_number },\n  binary: {\n    data: {\n      data: Buffer.from(content, 'utf-8').toString('base64'),\n      mimeType: 'text/markdown',\n      fileName: filename\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1248,
+        240
+      ],
+      "id": "ed1db398-03f6-4717-ae2b-63577817b730",
+      "name": "Build SOP File"
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "5611798761",
+        "binaryData": true,
+        "additionalFields": {
+          "caption": "=Approved SOP file: {{ $json.filename }}"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1440,
+        240
+      ],
+      "id": "557fd5e7-7a54-4bba-8801-8d3fb7b589af",
+      "name": "Send Approved File",
+      "webhookId": "67a06063-06e5-4ae7-b0c8-28d7301a1659",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Receive SOP Notes": {
+      "main": [
+        [
+          {
+            "node": "Is New Submission?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Title and Body": {
+      "main": [
+        [
+          {
+            "node": "Check Existing SOP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Existing SOP": {
+      "main": [
+        [
+          {
+            "node": "Is Existing SOP?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Existing SOP?": {
+      "main": [
+        [
+          {
+            "node": "Set Document ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create SOP Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create SOP Document": {
+      "main": [
+        [
+          {
+            "node": "Set Document ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Document ID": {
+      "main": [
+        [
+          {
+            "node": "Get Next Version",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Next Version": {
+      "main": [
+        [
+          {
+            "node": "Extract SOP Structure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate SOP": {
+      "main": [
+        [
+          {
+            "node": "Is SOP Complete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is SOP Complete?": {
+      "main": [
+        [
+          {
+            "node": "Render SOP Markdown",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ask For Missing Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render SOP Markdown": {
+      "main": [
+        [
+          {
+            "node": "Save SOP Version",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save SOP Version": {
+      "main": [
+        [
+          {
+            "node": "Mark In Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark In Review": {
+      "main": [
+        [
+          {
+            "node": "Send SOP For Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send SOP For Review": {
+      "main": [
+        []
+      ]
+    },
+    "Is New Submission?": {
+      "main": [
+        [
+          {
+            "node": "Parse Title and Body",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parse Reviewer Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Reviewer Decision": {
+      "main": [
+        [
+          {
+            "node": "Get Pending Version",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Pending Version": {
+      "main": [
+        [
+          {
+            "node": "Route Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Decision": {
+      "main": [
+        [
+          {
+            "node": "Approve Document",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject Document",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Revision Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify Reviewer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approve Document": {
+      "main": [
+        [
+          {
+            "node": "Confirm Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reject Document": {
+      "main": [
+        [
+          {
+            "node": "Confirm Rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Revision Request": {
+      "main": [
+        [
+          {
+            "node": "Regenerate SOP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract SOP Structure": {
+      "main": [
+        [
+          {
+            "node": "Validate SOP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Regenerate SOP": {
+      "main": [
+        [
+          {
+            "node": "Validate Revision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Revision": {
+      "main": [
+        [
+          {
+            "node": "Validate SOP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Reviewer Reply": {
+      "main": [
+        [
+          {
+            "node": "Route Classified Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Classified Decision": {
+      "main": [
+        [
+          {
+            "node": "Route Classified Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Classified Output": {
+      "main": [
+        [
+          {
+            "node": "Approve Document",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject Document",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Revision Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ask For Clarification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Approval": {
+      "main": [
+        [
+          {
+            "node": "Build SOP File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build SOP File": {
+      "main": [
+        [
+          {
+            "node": "Send Approved File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "0b5bed56-0da2-4a68-8157-0c1254694f94",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "mxXKvOo3i3cmTjrR",
+  "tags": []
+}

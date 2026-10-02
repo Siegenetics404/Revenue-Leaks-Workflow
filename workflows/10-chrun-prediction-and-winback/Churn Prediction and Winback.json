@@ -1,0 +1,2021 @@
+{
+  "name": "Churn Prediction and Winback",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2336,
+        -368
+      ],
+      "id": "161b931b-feac-4ccf-9fbb-74f39a1346f6",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH recent AS (\n  SELECT customer_id, AVG(key_actions) AS recent_actions\n  FROM usage_weekly\n  WHERE week_start >= CURRENT_DATE - INTERVAL '28 days'\n  GROUP BY customer_id\n), baseline AS (\n  SELECT customer_id, AVG(key_actions) AS base_actions\n  FROM usage_weekly\n  WHERE week_start <  CURRENT_DATE - INTERVAL '28 days'\n    AND week_start >= CURRENT_DATE - INTERVAL '84 days'\n  GROUP BY customer_id\n), tix AS (\n  SELECT customer_id, COUNT(*) AS neg_tickets\n  FROM support_tickets\n  WHERE sentiment = 'negative' AND created_at >= NOW() - INTERVAL '30 days'\n  GROUP BY customer_id\n), inv AS (\n  SELECT customer_id, COUNT(*) AS failed_payments\n  FROM churn_invoices\n  WHERE status = 'failed' AND due_date >= CURRENT_DATE - INTERVAL '60 days'\n  GROUP BY customer_id\n)\nSELECT c.*,\n  COALESCE(r.recent_actions,0)  AS recent_actions,\n  COALESCE(b.base_actions,0)    AS base_actions,\n  COALESCE(t.neg_tickets,0)     AS neg_tickets,\n  COALESCE(i.failed_payments,0) AS failed_payments\nFROM customers c\nLEFT JOIN recent r   ON r.customer_id = c.id\nLEFT JOIN baseline b ON b.customer_id = c.id\nLEFT JOIN tix t      ON t.customer_id = c.id\nLEFT JOIN inv i      ON i.customer_id = c.id\nWHERE c.status IN ('active','at_risk')\n  AND c.email NOT IN (SELECT email FROM suppression_list)\nORDER BY c.id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -2096,
+        -368
+      ],
+      "id": "ef4c070d-6eb6-48fb-b43d-d8de9f8ce3c6",
+      "name": "Get Customer Signals",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map(({ json: c }) => {\n  let score = 0;\n  const signals = [];\n\n  const base = Number(c.base_actions), recent = Number(c.recent_actions);\n  const drop = base > 0 ? 1 - recent / base : 0;\n  if (drop >= 0.5) {\n    score += 35;\n    signals.push({ code: \"USAGE_DROP_SEVERE\", fact: `Key actions down ${Math.round(drop * 100)}% vs prior 8 weeks` });\n  } else if (drop >= 0.25) {\n    score += 20;\n    signals.push({ code: \"USAGE_DROP\", fact: `Key actions down ${Math.round(drop * 100)}% vs prior 8 weeks` });\n  }\n\n  const idle = Math.floor((Date.now() - new Date(c.last_login_at)) / 86400000);\n  if (idle > 21) {\n    score += 25;\n    signals.push({ code: \"INACTIVE\", fact: `No login for ${idle} days` });\n  } else if (idle > 10) {\n    score += 10;\n    signals.push({ code: \"LOW_LOGINS\", fact: `Last login ${idle} days ago` });\n  }\n\n  const neg = Number(c.neg_tickets);\n  if (neg >= 2) {\n    score += 20;\n    signals.push({ code: \"NEG_TICKETS\", fact: `${neg} negative support tickets in 30 days` });\n  } else if (neg === 1) {\n    score += 10;\n    signals.push({ code: \"NEG_TICKET\", fact: \"1 negative support ticket in 30 days\" });\n  }\n\n  const failed = Number(c.failed_payments);\n  if (failed >= 1) {\n    score += 20;\n    signals.push({ code: \"PAYMENT_FAILED\", fact: `${failed} failed payment(s) in 60 days` });\n  }\n\n  const daysToRenewal = Math.ceil((new Date(c.renewal_date) - Date.now()) / 86400000);\n  if (daysToRenewal >= 0 && daysToRenewal <= 30) {\n    score += 10;\n    signals.push({ code: \"RENEWAL_SOON\", fact: `Renews in ${daysToRenewal} days` });\n  }\n\n  const tenure = Math.floor((Date.now() - new Date(c.signup_date)) / 86400000);\n  if (tenure < 90) {\n    score += 5;\n    signals.push({ code: \"NEW_CUSTOMER\", fact: `Customer for only ${tenure} days` });\n  }\n\n  score = Math.min(score, 100);\n  const tier = score >= 60 ? \"high\" : score >= 35 ? \"medium\" : \"low\";\n  const path = tier === \"high\" && Number(c.mrr) >= 500 ? \"human\" : \"auto\";\n\n  return { json: { ...c, risk_score: score, risk_tier: tier, signals, path } };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1856,
+        -368
+      ],
+      "id": "fd15f427-f8ae-4e70-888c-82bb7100cb0d",
+      "name": "Score Customers"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE customers SET\n  risk_score = $2,\n  risk_tier = $3::text,\n  risk_signals = $4::jsonb,\n  last_scored_at = NOW(),\n  status = CASE WHEN $3::text IN ('medium','high') THEN 'at_risk' ELSE 'active' END\nWHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.risk_score, $json.risk_tier, JSON.stringify($json.signals)] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -1632,
+        -368
+      ],
+      "id": "d250d766-dcad-4f20-ade6-d903b358cfe9",
+      "name": "Save Risk Score",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO score_history (customer_id, risk_score, risk_tier)\nSELECT (r->>'id')::int, (r->>'risk_score')::int, r->>'risk_tier'\nFROM jsonb_array_elements($1::jsonb) AS r;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($('Score Customers').all().map(i => ({ id: i.json.id, risk_score: i.json.risk_score, risk_tier: i.json.risk_tier })))] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -1392,
+        -368
+      ],
+      "id": "ac87e472-2e03-4521-ad7e-f4da579aad04",
+      "name": "Save Score History",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return $('Score Customers').all().map(i => ({ json: i.json }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1168,
+        -368
+      ],
+      "id": "9a356b73-76c1-4fb5-a8d3-a6a17452dc09",
+      "name": "Restore Scored Customers"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "44ac08e3-482f-482c-8419-6c1e9d40540a",
+              "leftValue": "={{ $json.risk_tier !== 'low' && (!$json.last_intervention_at || (Date.now() - new Date($json.last_intervention_at)) > 14 * 86400000) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -944,
+        -368
+      ],
+      "id": "686d84bf-11b0-422b-a91a-45e12242b7cd",
+      "name": "Needs Intervention?"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -624,
+        -528
+      ],
+      "id": "37245782-7ac2-43c8-b735-e6ad1ad79331",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a customer success manager writing the middle of a short, warm check-in email to a customer.\n\nYou are given a TONE. Follow it:\n- general: ask how things are going and whether anything is getting in the way.\n- billing: say you wanted to make sure their billing details are all set, then ask if there is anything you can help with on that front.\n- support: follow up on their recent experience with our support team, then ask if everything got resolved.\n\nRULES:\n- 35-70 words.\n- Output ONLY the email text itself. No JSON, no subject line, no quotation marks, no labels.\n- Do NOT write a greeting line and do NOT write a sign-off or any name. Both are added automatically. Start directly with the first sentence.\n- Never write \"CJ\", the customer's name, their company name, or their plan name.\n- You know nothing about this customer's behavior. Never write \"noticed\", \"saw\", \"seems\", \"appears\", or \"it looks like\". Never mention usage, activity, or logins. Write as if this is a routine friendly check-in sent to every customer.\n- No discounts, offers, coupons, or promises. No invented features.\n- No em-dashes. No exclamation marks. No bullet points.\n- Ask exactly ONE question. It must be the last sentence. Every other sentence must be a statement.\n\nExample output for tone \"general\":\nI wanted to reach out and see how things are going with your account. We always want to make sure you are getting real value from the product, and I would love to hear if anything has been getting in the way. Is there anything I can do to make things easier for you?\n\nExample output for tone \"billing\":\nI wanted to make sure everything on the billing side of your account is all set. Sometimes payment details need a quick update, and I am happy to sort that out with you so nothing gets in your way. Is there anything I can help with on that front?"
+            },
+            {
+              "content": "=Tone: {{ $json.signals.some(s => s.code === 'PAYMENT_FAILED') ? 'billing' : ($json.signals.some(s => s.code.startsWith('NEG_TICKET')) ? 'support' : 'general') }}\n\nWrite the middle of the email only, as plain text."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.4
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        -128,
+        -208
+      ],
+      "id": "d43c8a10-f0d9-40d5-8772-69cdee9115bf",
+      "name": "Write Check-in Email",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $('Loop Over Items').item.json;\nconst raw = $json.output?.[0]?.content?.[0]?.text ?? \"\";\n\nconst tone = src.signals.some(s => s.code === 'PAYMENT_FAILED')\n  ? 'billing'\n  : (src.signals.some(s => s.code.startsWith('NEG_TICKET')) ? 'support' : 'general');\n\nconst subjects = {\n  general: \"Checking in\",\n  billing: \"Quick billing check\",\n  support: \"Following up on your support experience\"\n};\nconst fallbackQuestion = {\n  general: \"Is there anything I can do to make things easier for you?\",\n  billing: \"Is there anything I can help with on that front?\",\n  support: \"Did everything get resolved to your satisfaction?\"\n};\n\n// whole-word matches only, so \"proactive\" or \"actively\" do not trigger it\nconst survRe = /\\b(notice[ds]?|noticing|noticeable|saw|seems?|appears?|looks like|logged|logging in|log in|logins?|usage|activity|inactive|inactivity|analytics|tracking|our data|dropped|declin\\w+|decreas\\w+|dormant|monitor\\w*|haven'?t (?:been|used|seen))\\b/i;\n\n// the model should return plain text; if it returns JSON anyway, pull the body out\nlet core = raw.replace(/`/g, \"\").trim();\nif (core.startsWith(\"{\")) {\n  try {\n    core = String(JSON.parse(core).body || \"\").trim();\n  } catch (e) {\n    const m = core.match(/\"body\"\\s*:\\s*\"([\\s\\S]*?)\"\\s*[,}]/);\n    core = m ? m[1].replace(/\\\\n/g, \" \").trim() : \"\";\n  }\n}\ncore = core.replace(/^[\"']+|[\"']+$/g, \"\").trim();\n\n// strip any greeting or sign-off the model added anyway\ncore = core.replace(/^(hi|hello|hey|dear)\\b[^\\n]*?,\\s*/i, \"\");\ncore = core.replace(/[\\s,]*(best regards|kind regards|warm regards|regards|best|thanks|cheers|sincerely)?[,\\s]*CJ\\s*$/i, \"\").trim();\ncore = core.replace(/\\s*\\n+\\s*/g, \" \");\n\n// REPAIR: drop risky sentences, keep only the last question, then make sure it ends with one question\nconst sentences = (core.match(/[^.?!]+[.?!]+(?:\\s|$)|[^.?!]+$/g) || [core]).map(s => s.trim()).filter(Boolean);\nconst dropped = [];\nconst kept = sentences.filter(s => {\n  if (survRe.test(s)) { dropped.push(s); return false; }\n  return true;\n});\nconst questions = kept.filter(s => s.endsWith(\"?\"));\nconst statements = kept.filter(s => !s.endsWith(\"?\"));\nquestions.slice(0, -1).forEach(q => dropped.push(q));\nconst finalQuestion = questions.length ? questions[questions.length - 1] : fallbackQuestion[tone];\ncore = [...statements, finalQuestion].join(\" \");\n\nconst subject = subjects[tone];\nconst words = core.split(/\\s+/).filter(Boolean).length;\nconst qCount = (core.match(/\\?/g) || []).length;\nconst body = `Hi ${src.first_name},\\n\\n${core}\\n\\nCJ`;\nconst surv = core.match(survRe);\n\nconst checks = {\n  hasBody:        core.length > 40,\n  lengthOk:       words >= 20 && words <= 100,\n  noPlaceholders: !/\\[.*?\\]|\\{\\{.*?\\}\\}|XYZ|Lorem/i.test(core),\n  noOffers:       !/discount|\\d+\\s?%|free (month|trial)|coupon|refund|promo/i.test(core),\n  noSurveillance: !surv,\n  noEmDash:       !/[—–]/.test(core),\n  noExclaim:      !/!/.test(core),\n  noStrayNames:   !/\\bCJ\\b/.test(core) && !core.includes(src.first_name) && !core.includes(src.company),\n  noPlanMention:  !new RegExp(\"\\\\b\" + src.plan + \"\\\\s+(plan|tier|subscription)\\\\b\", \"i\").test(core),\n  oneQuestion:    qCount === 1\n};\n\nconst detail = {\n  noSurveillance: surv ? `\"${surv[0]}\"` : \"\",\n  oneQuestion:    `${qCount} question marks`,\n  lengthOk:       `${words} words`\n};\n\nconst failed = Object.entries(checks)\n  .filter(([, v]) => !v)\n  .map(([k]) => detail[k] ? `${k} (${detail[k]})` : k);\n\nreturn { json: {\n  ...src,\n  tone,\n  subject,\n  body,\n  word_count: words,\n  repaired: dropped,\n  valid: failed.length === 0,\n  fail: failed.join(\", \"),\n  raw_output: raw.slice(0, 500)\n}};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        -208
+      ],
+      "id": "8679f06c-9a1a-4189-87db-86046862f985",
+      "name": "Validate Email Draft"
+    },
+    {
+      "parameters": {
+        "fromEmail": "franco.cj03@gmail.com",
+        "toEmail": "franco.cj03+u4@gmail.co",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}\n\nReply STOP and I won't email you about this again.",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        640,
+        -272
+      ],
+      "id": "71e59b4b-09b3-4b37-861a-c87dde4c02f5",
+      "name": "Send Check-in Email",
+      "webhookId": "7a68e51e-a2f6-40ab-880f-052b96b75e9f",
+      "credentials": {
+        "smtp": {
+          "id": "4jlPLz6lxGd7NpWX",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": "={{ Math.floor(45 + Math.random() * 46) }}"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        848,
+        -272
+      ],
+      "id": "df7cdc60-4ccd-485a-ae52-4627bc5eb915",
+      "name": "Space Out Sends",
+      "webhookId": "6f135f84-07ad-47c5-aff8-a6b5edc0ecf3"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO interventions (customer_id, kind, touch_no, subject, body)\n  VALUES ($1, 'checkin_email', 0, $2::text, $3::text)\n)\nUPDATE customers SET last_intervention_at = NOW() WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Validate Email Draft').first().json.id, $('Validate Email Draft').first().json.subject, $('Validate Email Draft').first().json.body] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1072,
+        -272
+      ],
+      "id": "e3309526-f230-46a5-a23f-faac34f6fec1",
+      "name": "Log Intervention",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $('Loop Over Items').item.json;\nconst raw = $json.output?.[0]?.content?.[0]?.text ?? \"\";\n\nlet p;\ntry {\n  p = JSON.parse(raw.replace(/`/g, \"\").replace(/^json/i, \"\").trim());\n} catch (e) {\n  return { json: { ...src, valid: false, fail: \"unparseable\" } };\n}\n\nconst summary = (p.summary || \"\").trim();\nconst reason = (p.likely_reason || \"\").trim();\nconst points = Array.isArray(p.talking_points) ? p.talking_points.map(t => String(t).trim()) : [];\nconst allText = [summary, reason, ...points].join(\" \");\n\n// every number the model mentions must come from the facts we gave it\nconst allowed = new Set(\n  src.signals.flatMap(s => s.fact.match(/\\d+/g) || [])\n    .concat([String(src.risk_score), String(Math.round(Number(src.mrr)))])\n);\nconst mentioned = allText.match(/\\d+/g) || [];\n\nconst checks = {\n  hasSummary:      summary.length > 20,\n  summaryShort:    summary.split(/\\s+/).filter(Boolean).length <= 45,\n  reasonOk:        /^Possibly/.test(reason),\n  pointsOk:        points.length >= 2 && points.length <= 4 && points.every(t => t.length > 10),\n  noInventedNums:  mentioned.every(n => allowed.has(n)),\n  noEmDash:        !/[—–]/.test(allText),\n  noPlaceholders:  !/\\[.*?\\]|\\{\\{.*?\\}\\}|XYZ|Lorem/i.test(allText)\n};\n\nconst failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);\n\nreturn { json: {\n  ...src,\n  briefing: { summary, likely_reason: reason, talking_points: points },\n  valid: failed.length === 0,\n  fail: failed.join(\",\")\n}};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        -400
+      ],
+      "id": "7a969a78-bda1-4eec-842b-d4d88444ad4c",
+      "name": "Validate Briefing"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.path }}",
+                    "rightValue": "human",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "be8e20e7-cab2-4d2d-8e46-c775b45d1f0e"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Human"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "68bc8b24-1896-4064-8f95-7a9a93263b37",
+                    "leftValue": "={{ $json.path }}",
+                    "rightValue": "auto",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Auto"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -384,
+        -304
+      ],
+      "id": "9449b1ca-124e-4c2d-bc1a-88681d8e14ad",
+      "name": "Route by Path"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "e4a16db5-2af9-40ac-b742-d809264ba6e7",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        416,
+        -400
+      ],
+      "id": "560518f4-17bd-44c1-ab45-f663f66027bb",
+      "name": "Briefing Valid?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "25685ccc-8cc5-4463-a350-6f7e445e2b1d",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        416,
+        -208
+      ],
+      "id": "02b92d7c-1ca2-40ae-bffa-52b87452b072",
+      "name": "Draft Valid?"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Account needs a call: {{ $json.company }} ({{ $json.plan }}, ${{ $json.mrr }}/mo)\nRisk: {{ $json.risk_score }}/100 | Renews: {{ $json.renewal_date }}\n\nSignals:\n{{ $json.signals.map(s => '- ' + s.fact).join('\\n') }}\n\n{{ $json.briefing.summary }}\n{{ $json.briefing.likely_reason }}\n\nTalking points:\n{{ $json.briefing.talking_points.map(t => '- ' + t).join('\\n') }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        -560
+      ],
+      "id": "8fbd5007-dc02-46cb-8c84-d93eecd5616e",
+      "name": "Send Briefing to Telegram",
+      "webhookId": "008d6e90-8bd8-422e-8287-af3f580e1776",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO interventions (customer_id, kind, touch_no, subject, body)\n  VALUES ($1, 'human_briefing', 0, 'Account briefing', $2::text)\n)\nUPDATE customers SET last_intervention_at = NOW() WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Validate Briefing').first().json.id, $('Validate Briefing').first().json.briefing.summary + ' ' + $('Validate Briefing').first().json.briefing.likely_reason + ' | ' + $('Validate Briefing').first().json.briefing.talking_points.join('; ')] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        864,
+        -560
+      ],
+      "id": "2f81b899-adf8-46f4-a132-01674469c257",
+      "name": "Log Briefing",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a customer success analyst. You write a short internal briefing for an account manager about a customer at risk of churning.\n\nRULES:\n- Use ONLY the facts provided. Never invent numbers, dates, causes, or history.\n- \"likely_reason\" is one sentence that starts with \"Possibly\".\n- \"summary\" is at most 40 words.\n- 2 to 4 talking points, each a concrete question to ask or action to take on the call.\n- No em-dashes.\n\nExample of the right format:\n{\"summary\": \"Acme is a high-value account showing several warning signs ahead of renewal.\", \"likely_reason\": \"Possibly the team has stopped seeing value in the product.\", \"talking_points\": [\"Ask what has changed in their workflow recently.\", \"Follow up on the open support issue.\"]}\n\nReturn ONLY valid JSON, no markdown fences:\n{\"summary\": \"...\", \"likely_reason\": \"...\", \"talking_points\": [\"...\"]}"
+            },
+            {
+              "content": "=Customer: {{ $json.company }} ({{ $json.plan }}, ${{ $json.mrr }}/month)\nRisk score: {{ $json.risk_score }}/100\n\nFacts:\n{{ $json.signals.map(s => '- ' + s.fact).join('\\n') }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        -128,
+        -400
+      ],
+      "id": "22071826-8924-4452-8241-6c17c9fe25f3",
+      "name": "Write Account Briefing",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Draft failed, nothing sent: {{ $json.company }} ({{ $json.path }} path)\nReason: {{ $json.fail }}\nSkipped for today.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        -64
+      ],
+      "id": "8a72ca64-b8ec-4c7f-90f1-19f83735eb83",
+      "name": "Alert Failed Draft",
+      "webhookId": "008d6e90-8bd8-422e-8287-af3f580e1776",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cancel",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -720,
+        368
+      ],
+      "id": "b2d60aac-815b-4c6c-a21a-417cad60eed4",
+      "name": "Cancel Webhook",
+      "webhookId": "ad8444f5-ff5e-4ef6-8008-909067752479"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Classify a customer's cancellation reason into exactly one category.\n\nCategories:\nPRICE - too expensive, budget cuts, cost is the main driver\nMISSING_FEATURE - lacks a feature or capability they need\nCOMPETITOR - switching to another product for reasons other than price\nNOT_USING - not enough use, never got value, too busy, no time\nSUPPORT_BAD - unhappy with support or a bad experience with the team\nBUSINESS_CLOSED - company shut down or no longer needs this kind of tool\nUNKNOWN - empty, vague, or unclear\n\nIf price or cost is mentioned as a reason, choose PRICE even if they are also switching to another product.\n\nReply with ONLY the category name in capital letters. No punctuation, no explanation."
+            },
+            {
+              "content": "=Cancellation reason: {{ $json.body.reason || '' }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        -464,
+        368
+      ],
+      "id": "db22ea9a-0472-4395-9180-2330e36475d8",
+      "name": "Classify Cancel Reason",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const allowed = [\"PRICE\", \"MISSING_FEATURE\", \"COMPETITOR\", \"NOT_USING\", \"SUPPORT_BAD\", \"BUSINESS_CLOSED\", \"UNKNOWN\"];\nconst raw = String($json.output?.[0]?.content?.[0]?.text ?? \"\").toUpperCase();\nconst found = allowed.find(c => new RegExp(\"\\\\b\" + c + \"\\\\b\").test(raw));\n\nconst wh = $('Cancel Webhook').item.json.body || {};\n\nreturn { json: {\n  email: String(wh.email || \"\").trim().toLowerCase(),\n  reason_raw: String(wh.reason || \"\").trim(),\n  cancel_reason: found || \"UNKNOWN\",\n  classifier_output: raw.slice(0, 60)\n}};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -96,
+        368
+      ],
+      "id": "668846c5-18d8-497b-bfa6-d8a1141b12ff",
+      "name": "Clean Reason Category"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE customers SET\n  status = CASE WHEN $3::text = 'BUSINESS_CLOSED' THEN 'lost' ELSE 'churned' END,\n  cancelled_at = NOW(),\n  cancel_reason_raw = $2::text,\n  cancel_reason = $3::text,\n  winback_touch = 0,\n  next_winback_at = NOW() + INTERVAL '3 days'\nWHERE lower(email) = $1::text\n  AND status IN ('active', 'at_risk')\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [$json.email, $json.reason_raw, $json.cancel_reason] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        128,
+        368
+      ],
+      "id": "4c88303d-4bb0-4ad4-b553-c5a3510db562",
+      "name": "Mark Customer Churned",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "7801438c-3c7c-41db-94f9-7446bdb5567e",
+              "leftValue": "={{ Number($json.mrr) >= 500 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        368,
+        368
+      ],
+      "id": "41cfb3dd-79f8-4695-a224-621968211704",
+      "name": "High Value Cancel?"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=High-value cancellation: {{ $json.company }} ({{ $json.plan }}, ${{ $json.mrr }}/mo)\nReason category: {{ $json.cancel_reason }}\nTheir words: {{ $json.cancel_reason_raw }}\n\nCall within 24h. Automated winback emails start {{ String($json.next_winback_at).slice(0, 10) }}.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        608,
+        256
+      ],
+      "id": "ef879d64-65e6-4b0f-957c-ecc99d2bea28",
+      "name": "Alert High Value Cancel",
+      "webhookId": "008d6e90-8bd8-422e-8287-af3f580e1776",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  status: $('Mark Customer Churned').first().json.id ? 'churn_recorded' : 'no_matching_active_customer',\n  customer_id: $('Mark Customer Churned').first().json.id || null,\n  cancel_reason: $('Mark Customer Churned').first().json.cancel_reason || null\n} }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        816,
+        384
+      ],
+      "id": "f77f1883-e378-416f-90b3-5ab4edb1b987",
+      "name": "Respond to Cancel Event"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 10
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -720,
+        592
+      ],
+      "id": "72c4dcd0-8fec-4da0-bac9-a71bdd9fe3ba",
+      "name": "Daily Winback Schedule"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT c.id, c.first_name, c.company, c.email, c.plan, c.mrr,\n  c.cancelled_at, c.cancel_reason, c.cancel_reason_raw, c.winback_touch,\n  o.code AS offer_code, o.description AS offer_desc, o.discount_pct,\n  (SELECT COALESCE(jsonb_agg(to_jsonb(u)), '[]'::jsonb)\n   FROM (SELECT id, title, summary FROM product_updates\n         WHERE released_at >= c.cancelled_at::date\n         ORDER BY released_at DESC LIMIT 3) u) AS updates\nFROM customers c\nLEFT JOIN offers o ON o.reason = c.cancel_reason\nWHERE c.status = 'churned'\n  AND c.winback_touch < 3\n  AND c.next_winback_at <= NOW()\n  AND lower(c.email) NOT IN (SELECT lower(email) FROM suppression_list)\nORDER BY c.mrr DESC\nLIMIT 10;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -448,
+        592
+      ],
+      "id": "1c362ddc-f0cc-47f0-9330-339786252f13",
+      "name": "Get Due Winbacks",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const reasonPhrase = {\n  PRICE: \"the cost was a concern\",\n  MISSING_FEATURE: \"the product was missing something they needed\",\n  NOT_USING: \"it was not the right fit at the time\",\n  SUPPORT_BAD: \"their support experience fell short of what it should be\",\n  COMPETITOR: \"\",\n  UNKNOWN: \"\"\n};\n\nreturn $input.all().map(({ json: l }) => {\n  const t = Number(l.winback_touch);\n  const updates = Array.isArray(l.updates) ? l.updates : [];\n  let angle, subject, goal, fixed_line = \"\";\n\n  if (t === 0) {\n    angle = \"thanks\";\n    subject = \"Thank you, and one quick question\";\n    goal = \"Thank them for having been a customer. Say you would value their honest feedback. Ask what one thing would have made them stay. No pitch and no offer.\";\n  } else if (t === 1) {\n    if (l.cancel_reason === \"MISSING_FEATURE\" && updates.length) {\n      angle = \"updates\";\n      subject = \"What is new since you left\";\n      goal = \"Say you wanted to reach out with a quick note now that some time has passed. Do not mention the product, features, cost, or any changes, because a sentence with the details is added automatically. Ask whether they would like to take a look.\";\n      fixed_line = \"Here is what we have shipped since you left: \" + updates.map(u => u.title).join(\", \") + \".\";\n    } else if (l.cancel_reason === \"PRICE\" && l.discount_pct > 0) {\n      angle = \"offer\";\n      subject = \"A thought on pricing\";\n      goal = \"Acknowledge that cost was a concern, kindly. Say you would like to make it easier for them to come back. Ask whether they would like to take a second look.\";\n      fixed_line = \"We can offer \" + l.offer_desc + \" if you decide to come back.\";\n    } else if ([\"NOT_USING\", \"SUPPORT_BAD\"].includes(l.cancel_reason) && l.offer_code) {\n      angle = \"offer\";\n      subject = \"Making it right\";\n      goal = \"Acknowledge their earlier experience, kindly and briefly. Say you would like to make it easier for them to give the product another try. Ask whether that would be helpful.\";\n      fixed_line = \"If it helps, I can arrange \" + l.offer_desc + \".\";\n    } else {\n      angle = \"checkin\";\n      subject = \"Checking in\";\n      goal = \"A soft check-in. Ask whether anything has changed on their side since they left. No pitch and no offer.\";\n    }\n  } else {\n    angle = \"final\";\n    subject = \"A final note from me\";\n    goal = \"A polite final note. Say this is the last time you will reach out and that the door is always open. Ask whether they would like you to keep in touch or close their file.\";\n  }\n\n  return { json: {\n    ...l,\n    angle,\n    subject,\n    goal,\n    reason_phrase: (t === 2 || angle === \"updates\") ? \"\" : (reasonPhrase[l.cancel_reason] || \"\"),\n    fixed_line,\n    days_since_cancel: Math.floor((Date.now() - new Date(l.cancelled_at)) / 86400000)\n  }};\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -208,
+        592
+      ],
+      "id": "b4b5a4b7-9c29-499c-a985-28f5630c5594",
+      "name": "Pick Winback Angle"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        64,
+        592
+      ],
+      "id": "91f079a1-8010-4619-8610-4c56c1b3d543",
+      "name": "Loop Winbacks"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a customer success manager writing the middle of a short, warm email to a FORMER customer who cancelled.\n\nYou are given a GOAL and sometimes a REASON HINT. Follow the goal.\n\nRULES:\n- 30-65 words.\n- Output ONLY the email text itself. No JSON, no subject line, no quotation marks, no labels.\n- Do NOT write a greeting line and do NOT write a sign-off or any name. Both are added automatically. Start directly with the first sentence.\n- Never write \"CJ\", the customer's name, their company name, or their plan name.\n- Only mention a reason for leaving if a REASON HINT is given, and only that reason, in your own words, once. Never invent or guess a reason. If there is no hint, do not mention why they left.\n- Never mention cost, price, or money unless the GOAL itself says that cost was a concern.\n- Never say anything about the product itself: no features, no updates, no improvements, no changes, no \"we have been building\". Never mention discounts, offers, or free trials. If any of those apply, a separate sentence is added automatically after your text. Do not write about them or hint at them.\n- You know nothing about this customer's behavior. Never write \"noticed\", \"saw\", \"seems\", \"appears\", or \"it looks like\".\n- No guilt-tripping. Never write \"we miss you\". No urgency, deadlines, or pressure.\n- No em-dashes. No exclamation marks. No bullet points.\n- Ask exactly ONE question. It must be the last sentence. Every other sentence must be a statement.\n\nExample output for a goal of thanking them and asking for feedback:\nThank you for having been a customer of ours. I would genuinely value your honest feedback as we keep improving. What is the one thing that would have made you stay?\n\nExample output for a goal of making it easier to come back:\nI would like to make it easier for you to consider coming back, and I am glad to help with anything that would make that simple. Would you like to take a second look?\n\nExample output for a quick note:\nI wanted to reach out with a quick note now that some time has passed. Would you like to take a look?\n\nExample output for a final note:\nThis will be my last note, and I want you to know the door is always open if things change on your side. I am glad to keep in touch or to close your file, whichever you prefer. Which would you like?"
+            },
+            {
+              "content": "=Goal: {{ $json.goal }}\nReason hint: {{ $json.reason_phrase || 'none' }}\n\nWrite the middle of the email only, as plain text."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "temperature": 0.4
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        336,
+        608
+      ],
+      "id": "9c9e9bf3-04b9-4110-ae0a-9c652a4ec129",
+      "name": "Write Winback Email",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $('Loop Winbacks').item.json;\nconst raw = $json.output?.[0]?.content?.[0]?.text ?? \"\";\n\nconst fallbackQuestion = {\n  thanks:  \"What is the one thing that would have made you stay?\",\n  updates: \"Would you like to take a look?\",\n  offer:   \"Would you like to take a second look?\",\n  checkin: \"Has anything changed on your side since you left?\",\n  final:   \"Would you like me to keep in touch, or close your file?\"\n};\n// safe, code-written openers used only when the AI's own text is unusable\nconst fallbackOpener = {\n  thanks:  \"Thank you for having been a customer of ours, and I would genuinely value your honest feedback.\",\n  updates: \"I wanted to reach out with a quick note now that some time has passed.\",\n  offer:   \"I would like to make it easier for you to consider coming back.\",\n  checkin: \"I wanted to reach out and see how things are on your side.\",\n  final:   \"This will be my last note, and the door is always open if things change on your side.\"\n};\n\n// whole-word matches only\nconst survRe = /\\b(notice[ds]?|noticing|saw|seems?|appears?|looks like|logged|logging in|log in|logins?|usage|activity|inactive|analytics|tracking|our data|monitor\\w*)\\b/i;\nconst pressureRe = /\\b(miss(?:ed)? you|expires?|last chance|limited time|hurry|deadline|act now|only \\d+ (?:days|hours))\\b/i;\nconst productRe = /\\b(features?|functionality|evolv\\w*|building|built|adding|added|enhanc\\w*|upgrad\\w*|updates?|improvements?|new|shipped|launched|released)\\b/i;\nconst moneyRe = /discount|coupon|free (?:month|trial)|\\d+\\s?%|\\bprice\\b|\\bpricing\\b|\\boffer(?:s|ed|ing)?\\b/i;\n// reason words are only allowed when they match the customer's real reason\nconst costRe = /\\b(cost|costs|costly|expensive|afford\\w*|budget\\w*|cheap\\w*)\\b/i;\nconst supportRe = /\\b(support|service team|help desk)\\b/i;\n\n// the model should return plain text; if it returns JSON anyway, pull the body out\nlet core = raw.replace(/`/g, \"\").trim();\nif (core.startsWith(\"{\")) {\n  try {\n    core = String(JSON.parse(core).body || \"\").trim();\n  } catch (e) {\n    const m = core.match(/\"body\"\\s*:\\s*\"([\\s\\S]*?)\"\\s*[,}]/);\n    core = m ? m[1].replace(/\\\\n/g, \" \").trim() : \"\";\n  }\n}\ncore = core.replace(/^[\"']+|[\"']+$/g, \"\").trim();\ncore = core.replace(/^(hi|hello|hey|dear)\\b[^\\n]*?,\\s*/i, \"\");\ncore = core.replace(/[\\s,]*(best regards|kind regards|warm regards|regards|best|thanks|cheers|sincerely)?[,\\s]*CJ\\s*$/i, \"\").trim();\ncore = core.replace(/\\s*\\n+\\s*/g, \" \");\n\n// which reason words this customer's email may legitimately use\nconst costOk = src.cancel_reason === \"PRICE\";\nconst supportOk = src.cancel_reason === \"SUPPORT_BAD\";\n\n// REPAIR: drop risky sentences, keep only the last question\nconst sentences = (core.match(/[^.?!]+[.?!]+(?:\\s|$)|[^.?!]+$/g) || [core]).map(s => s.trim()).filter(Boolean);\nconst dropped = [];\nconst kept = sentences.filter(s => {\n  if (survRe.test(s) || pressureRe.test(s) || productRe.test(s) || moneyRe.test(s)) { dropped.push(s); return false; }\n  if ((!costOk && costRe.test(s)) || (!supportOk && supportRe.test(s))) { dropped.push(s); return false; }\n  return true;\n});\nconst questions = kept.filter(s => s.endsWith(\"?\"));\nlet statements = kept.filter(s => !s.endsWith(\"?\"));\nquestions.slice(0, -1).forEach(q => dropped.push(q));\nconst finalQuestion = questions.length ? questions[questions.length - 1] : fallbackQuestion[src.angle];\n\n// if almost nothing usable is left, use the safe code-written opener\nconst statementWords = statements.join(\" \").split(/\\s+/).filter(Boolean).length;\nlet usedFallback = false;\nif (statementWords < 8) {\n  statements = [fallbackOpener[src.angle]];\n  usedFallback = true;\n}\n\nconst modelText = [...statements, finalQuestion].join(\" \");\nconst middle = [...statements, src.fixed_line, finalQuestion].filter(Boolean).join(\" \");\nconst body = `Hi ${src.first_name},\\n\\n${middle}\\n\\nCJ`;\n\nconst words = modelText.split(/\\s+/).filter(Boolean).length;\nconst qCount = (middle.match(/\\?/g) || []).length;\nconst pcts = [...body.matchAll(/(\\d+)\\s?%/g)].map(m => Number(m[1]));\nconst surv = modelText.match(survRe);\n\nconst checks = {\n  hasBody:         modelText.length > 30,\n  lengthOk:        words >= 12 && words <= 90,\n  noPlaceholders:  !/\\[.*?\\]|\\{\\{.*?\\}\\}|XYZ|Lorem/i.test(modelText),\n  noMoneyTalk:     !moneyRe.test(modelText),\n  noProductClaims: !productRe.test(modelText),\n  noWrongReason:   (costOk || !costRe.test(modelText)) && (supportOk || !supportRe.test(modelText)),\n  offerGrounded:   pcts.every(n => n === Number(src.discount_pct)) && (pcts.length === 0 || src.angle === \"offer\"),\n  noSurveillance:  !surv,\n  noPressure:      !pressureRe.test(modelText),\n  noEmDash:        !/[—–]/.test(modelText),\n  noExclaim:       !/!/.test(modelText),\n  noStrayNames:    !/\\bCJ\\b/.test(modelText) && !modelText.includes(src.first_name) && !modelText.includes(src.company),\n  noPlanMention:   !new RegExp(\"\\\\b\" + src.plan + \"\\\\s+(plan|tier|subscription)\\\\b\", \"i\").test(modelText),\n  oneQuestion:     qCount === 1\n};\n\n// plain-English reasons, so the alert makes sense to a human\nconst reasons = {\n  hasBody:         \"The email text was too short to send.\",\n  lengthOk:        `The email text was ${words} words after cleanup (it needs 12 to 90).`,\n  noPlaceholders:  \"The AI left a placeholder like [name] in the text.\",\n  noMoneyTalk:     \"The AI brought up prices or discounts on its own.\",\n  noProductClaims: \"The AI made claims about the product on its own.\",\n  noWrongReason:   \"The AI stated a reason for leaving that does not match why this customer cancelled.\",\n  offerGrounded:   \"A percentage in the email did not match the real offer.\",\n  noSurveillance:  `The AI implied we were watching their activity${surv ? ` (it used \"${surv[0]}\")` : \"\"}.`,\n  noPressure:      \"The AI used pressure or guilt wording.\",\n  noEmDash:        \"The AI used a dash character we do not allow.\",\n  noExclaim:       \"The AI used an exclamation mark.\",\n  noStrayNames:    \"The AI wrote a name (CJ, the customer, or the company) inside the body.\",\n  noPlanMention:   \"The AI mentioned the customer's plan name.\",\n  oneQuestion:     `The email had ${qCount} questions instead of exactly 1.`\n};\n\nconst failed = Object.entries(checks).filter(([, v]) => !v).map(([k]) => reasons[k]);\n\nreturn { json: {\n  ...src,\n  body,\n  word_count: words,\n  used_fallback: usedFallback,\n  repaired: dropped,\n  valid: failed.length === 0,\n  fail: failed.join(\" \"),\n  raw_output: raw.slice(0, 400)\n}};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        608
+      ],
+      "id": "a91e638a-9f60-400a-895a-ec97070ea9d4",
+      "name": "Validate Winback Draft"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "67b90674-c50d-498b-b1f2-722c992abef8",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        912,
+        608
+      ],
+      "id": "3e48de2f-2268-409b-b851-9acef62660b0",
+      "name": "Winback Draft Valid?"
+    },
+    {
+      "parameters": {
+        "fromEmail": "franco.cj03@gmail.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}\n\nReply STOP and I won't email you about this again.",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1152,
+        592
+      ],
+      "id": "50181974-dfde-4037-9067-45d4a8086a30",
+      "name": "Send Winback Email",
+      "webhookId": "7a68e51e-a2f6-40ab-880f-052b96b75e9f",
+      "credentials": {
+        "smtp": {
+          "id": "4jlPLz6lxGd7NpWX",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1376,
+        592
+      ],
+      "id": "98c268c7-e782-428b-851d-b6c9ef17fa6d",
+      "name": "Space Out Winbacks",
+      "webhookId": "58dd582c-31d8-4a2a-b154-7fe3d870e15c"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO interventions (customer_id, kind, touch_no, subject, body)\n  VALUES ($1, 'winback_email', $4::int, $2::text, $3::text)\n)\nUPDATE customers SET\n  next_winback_at = NOW() + CASE winback_touch\n    WHEN 0 THEN INTERVAL '27 days'\n    WHEN 1 THEN INTERVAL '60 days'\n    ELSE NULL END,\n  status = CASE WHEN winback_touch + 1 >= 3 THEN 'lost' ELSE status END,\n  winback_touch = winback_touch + 1\nWHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Validate Winback Draft').first().json.id, $('Validate Winback Draft').first().json.subject, $('Validate Winback Draft').first().json.body, Number($('Validate Winback Draft').first().json.winback_touch) + 1] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1584,
+        592
+      ],
+      "id": "37db9b67-a815-4b94-bce4-195ff320c352",
+      "name": "Log Winback Touch",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Winback email NOT sent: {{ $json.company }} ({{ $json.angle }} email, touch {{ Number($json.winback_touch) + 1 }} of 3)\n\nWhy: {{ $json.fail }}\n\nWhat the AI wrote: {{ $json.raw_output || '(nothing)' }}\n\nRemoved by the safety filter: {{ ($json.repaired || []).join(' | ') || 'nothing' }}\n\nNothing was sent. It will retry on the next daily run.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1168,
+        800
+      ],
+      "id": "d414ab7f-09f7-4c33-b778-24129d670a77",
+      "name": "Alert Failed Winback",
+      "webhookId": "008d6e90-8bd8-422e-8287-af3f580e1776",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "postProcessAction": "nothing",
+        "options": {
+          "customEmailConfig": "[\"UNSEEN\", [\"SUBJECT\", \"Re:\"]]"
+        }
+      },
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.2,
+      "position": [
+        -2848,
+        464
+      ],
+      "id": "176fa885-c1ad-4e80-9a52-2210f6da6f6f",
+      "name": "Read Replies",
+      "credentials": {
+        "imap": {
+          "id": "dVc9Ye84ZzY50NgT",
+          "name": "IMAP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = String($json.textPlain || \"\").replace(/\\r/g, \"\");\n\n// keep only what the person actually wrote, drop the quoted history\nconst cutAt = body.search(/\\n\\s*On [\\s\\S]{0,200}?wrote:|\\n-{3,}\\s*Original Message|\\n>/i);\nconst reply = (cutAt === -1 ? body : body.slice(0, cutAt)).trim().slice(0, 1500);\n\n// every email address in From and To, so the database can decide which is a customer\nconst found = (String($json.from || \"\") + \" \" + String($json.to || \"\"))\n  .match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi) || [];\nconst candidates = [...new Set(found.map(e => e.toLowerCase()))];\n\nreturn { json: {\n  subject: $json.subject || \"\",\n  reply,\n  candidates,\n  message_id: $json.metadata?.[\"message-id\"] || \"\"\n}};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2624,
+        464
+      ],
+      "id": "7506647b-30f9-4520-bb09-5700657c66e4",
+      "name": "Clean Reply"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, first_name, company, email, plan, mrr, status,\n       cancel_reason, winback_touch\nFROM customers\nWHERE lower(email) IN (\n  SELECT lower(value) FROM jsonb_array_elements_text($1::jsonb)\n)\nORDER BY (status IN ('churned', 'at_risk')) DESC, id\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.candidates)] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -2400,
+        464
+      ],
+      "id": "8a4f3db5-79ac-4be8-a29a-ae7a5232ab4d",
+      "name": "Find Customer",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "qwen2.5-7b-instruct-1m",
+          "mode": "list",
+          "cachedResultName": "QWEN2.5-7B-INSTRUCT-1M"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Classify a reply from a current or former customer into exactly one category.\n\nCategories:\nWANTS_TO_RETURN - clearly says they want to come back, resume, reactivate, or talk about returning\nQUESTION - asks something but is not committing to return\nPRICE_OBJECTION - says price is the barrier, or asks for a deal or discount\nNOT_INTERESTED - declines, says no, or says they are not coming back\nUNSUBSCRIBE - asks to stop emails, to be removed, or uses angry or legal language\nAUTO_REPLY - out of office, bounce, or automatic reply\n\nIf the person says both that they want to return and asks a question, choose WANTS_TO_RETURN.\nIf the reply is unclear, choose QUESTION.\n\nReply with ONLY the category name in capital letters. No punctuation, no explanation."
+            },
+            {
+              "content": "=Reply: {{ $('Clean Reply').first().json.reply }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        -2176,
+        464
+      ],
+      "id": "336f6e35-5908-442b-ba92-46b4874a0fd5",
+      "name": "Classify Reply",
+      "credentials": {
+        "openAiApi": {
+          "id": "QKspIILvOeEnfNO4",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const allowed = [\"WANTS_TO_RETURN\", \"QUESTION\", \"PRICE_OBJECTION\", \"NOT_INTERESTED\", \"UNSUBSCRIBE\", \"AUTO_REPLY\"];\nconst raw = String($json.output?.[0]?.content?.[0]?.text ?? \"\").toUpperCase();\nconst modelCategory = allowed.find(c => new RegExp(\"\\\\b\" + c + \"\\\\b\").test(raw));\n\nconst clean = $('Clean Reply').first().json;\nconst customer = $('Find Customer').first().json || {};\nconst reply = clean.reply || \"\";\nconst subject = clean.subject || \"\";\n\nconst autoReplyRe = /automatic reply|auto-?reply|out of office|undeliverable|delivery status notification|mail delivery/i;\nconst unsubscribeRe = /\\bunsubscribe\\b|^\\s*stop\\b|\\bstop (?:emailing|sending|contacting|messaging)\\b|\\bremove me\\b|\\btake me off\\b|\\bdo not (?:contact|email)\\b|\\bdon'?t (?:contact|email)\\b|\\bopt[ -]?out\\b|\\bleave me alone\\b|\\bspam\\b/i;\n\nlet category, source;\nif (autoReplyRe.test(subject)) {\n  category = \"AUTO_REPLY\"; source = \"code: auto-reply or bounce subject\";\n} else if (unsubscribeRe.test(reply)) {\n  category = \"UNSUBSCRIBE\"; source = \"code: unsubscribe wording\";\n} else if (modelCategory) {\n  category = modelCategory; source = \"model\";\n} else {\n  category = \"QUESTION\"; source = \"fallback: model answer not recognised\";\n}\n\nreturn { json: {\n  customer_found: Boolean(customer.id),\n  id: customer.id || null,\n  first_name: customer.first_name || null,\n  company: customer.company || null,\n  email: customer.email || null,\n  mrr: customer.mrr || null,\n  status: customer.status || null,\n  cancel_reason: customer.cancel_reason || null,\n  subject,\n  reply,\n  category,\n  category_source: source,\n  model_output: raw.slice(0, 60)\n}};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1808,
+        464
+      ],
+      "id": "aaade83a-1484-4374-8694-ad05935a3b8f",
+      "name": "Decide Reply Action"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.customer_found && $json.category === 'WANTS_TO_RETURN' }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    },
+                    "id": "b2d96137-b029-485b-a1e5-a9b1ecc83bfb"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "won_back"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "d36f1993-63ae-409e-9cfc-2875eee18efa",
+                    "leftValue": "={{ $json.customer_found && ['QUESTION','PRICE_OBJECTION'].includes($json.category) }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "needs_human"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "558fdc49-e5fb-4418-b0b6-95feef8cbda5",
+                    "leftValue": "={{ $json.customer_found && $json.category === 'NOT_INTERESTED' }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "lost"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "d57a848d-9dd8-42f4-b5a5-7403877e5eac",
+                    "leftValue": "={{ $json.category === 'UNSUBSCRIBE' }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "unsubscribe"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -1584,
+        464
+      ],
+      "id": "d83b8846-deb7-4362-a04c-03a1aef28de2",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Win-back: {{ $('Decide Reply Action').first().json.company }} wants to come back (${{ $('Decide Reply Action').first().json.mrr }}/mo)\n\nTheir reply: {{ $('Decide Reply Action').first().json.reply }}\n\nReactivate their plan manually and reply to them.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1056,
+        208
+      ],
+      "id": "05b5ca32-5142-4fc9-b577-2c440f48c8d6",
+      "name": "Alert Won Back",
+      "webhookId": "008d6e90-8bd8-422e-8287-af3f580e1776",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE customers\nSET status = 'won_back', won_back_at = NOW(), next_winback_at = NULL\nWHERE id = $1\nRETURNING id, company, mrr;",
+        "options": {
+          "queryReplacement": "={{ [$json.id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -1280,
+        208
+      ],
+      "id": "40dc3e2b-d67c-4799-a5a8-8abad97aeda0",
+      "name": "Mark Won Back",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE customers SET next_winback_at = NULL WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -1280,
+        400
+      ],
+      "id": "21a28624-5313-45e8-aaa4-c5fbc63a6d72",
+      "name": "Pause Automation",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Reply needs a human: {{ $('Decide Reply Action').first().json.company }} ({{ $('Decide Reply Action').first().json.category }})\n\n{{ $('Decide Reply Action').first().json.reply }}\n\nReason on file: {{ $('Decide Reply Action').first().json.cancel_reason }}. Automated emails to them are paused.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1056,
+        400
+      ],
+      "id": "4bbd312f-5ab8-47f3-845c-8eae4de835aa",
+      "name": "Alert Needs Reply",
+      "webhookId": "008d6e90-8bd8-422e-8287-af3f580e1776",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE customers SET status = 'lost', next_winback_at = NULL WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -1280,
+        576
+      ],
+      "id": "391717a5-fa43-4dbe-89bb-a026fefddd5e",
+      "name": "Mark Lost",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH s AS (\n  INSERT INTO suppression_list (email, reason)\n  SELECT lower(v), 'unsubscribe reply'\n  FROM jsonb_array_elements_text($1::jsonb) v\n  WHERE NOT EXISTS (SELECT 1 FROM suppression_list x WHERE lower(x.email) = lower(v))\n  RETURNING email\n)\nUPDATE customers\nSET status = 'unsubscribed', next_winback_at = NULL\nWHERE lower(email) IN (SELECT lower(v) FROM jsonb_array_elements_text($1::jsonb) v);",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.customer_found ? [$json.email] : $('Clean Reply').first().json.candidates)] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -1280,
+        768
+      ],
+      "id": "24766ec6-9f5e-4780-a90b-15d3cc3906c4",
+      "name": "Add to Suppression",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ]
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -2848,
+        688
+      ],
+      "id": "94c75971-6466-4b2f-921a-b88a75803e97",
+      "name": "Monday Report Schedule"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH hd AS (\n  SELECT\n    COUNT(*) FILTER (WHERE status = 'at_risk') AS at_risk,\n    COALESCE(SUM(mrr) FILTER (WHERE status = 'at_risk'), 0) AS mrr_at_risk,\n    COUNT(*) FILTER (WHERE status = 'churned' AND cancelled_at >= NOW() - INTERVAL '7 days') AS new_churn,\n    COALESCE(SUM(mrr) FILTER (WHERE status = 'churned' AND cancelled_at >= NOW() - INTERVAL '7 days'), 0) AS mrr_lost,\n    COUNT(*) FILTER (WHERE status = 'won_back' AND won_back_at >= NOW() - INTERVAL '7 days') AS won_back,\n    COALESCE(SUM(mrr) FILTER (WHERE status = 'won_back' AND won_back_at >= NOW() - INTERVAL '7 days'), 0) AS mrr_recovered\n  FROM customers\n), ad AS (\n  SELECT COALESCE(jsonb_object_agg(risk_tier, n), '{}'::jsonb) AS tiers\n  FROM (\n    SELECT sh.risk_tier, COUNT(*) AS n\n    FROM customers c\n    JOIN LATERAL (\n      SELECT risk_tier FROM score_history\n      WHERE customer_id = c.id AND scored_at <= c.cancelled_at - INTERVAL '14 days'\n      ORDER BY scored_at DESC LIMIT 1\n    ) sh ON TRUE\n    WHERE c.cancelled_at >= NOW() - INTERVAL '90 days'\n    GROUP BY sh.risk_tier\n  ) t\n)\nSELECT hd.*, ad.tiers FROM hd, ad;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -2640,
+        688
+      ],
+      "id": "ff2cb910-a259-4fa5-a23e-fba3facf06b8",
+      "name": "Weekly Numbers",
+      "credentials": {
+        "postgres": {
+          "id": "XWCDBkkzNdrWML9A",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "5611798761",
+        "text": "=Weekly churn report\n\nAt risk now: {{ $json.at_risk }} accounts, ${{ $json.mrr_at_risk }}/mo\nCancelled this week: {{ $json.new_churn }} (${{ $json.mrr_lost }}/mo lost)\nWon back this week: {{ $json.won_back }} (${{ $json.mrr_recovered }}/mo recovered)\n\nDid the tiers predict churn? (tier 14+ days before cancelling, last 90 days)\n{{ Object.keys($json.tiers).length ? Object.entries($json.tiers).map(([k, v]) => k + ': ' + v).join(', ') : 'Not enough score history yet.' }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -2432,
+        688
+      ],
+      "id": "6a59ae0f-8dae-4f85-9c2b-66087f62258b",
+      "name": "Send Weekly Report",
+      "webhookId": "008d6e90-8bd8-422e-8287-af3f580e1776",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "telegramApi": {
+          "id": "gnOvrBP8wS4Qfuu3",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Churn C - Replies and Report",
+        "height": 800,
+        "width": 2080,
+        "color": "#05662A"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2928,
+        160
+      ],
+      "id": "c8dd6570-e008-437d-adcb-733ad859f7ec",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "content": "##  Churn B - Cancellation and Winback",
+        "height": 864,
+        "width": 2608,
+        "color": "#3B2C87"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -816,
+        160
+      ],
+      "id": "d2dfd3fb-b628-4f16-85dd-5921d34b3b03",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## Churn A - Risk Scoring and Save",
+        "height": 848,
+        "width": 3728,
+        "color": "#8C431D"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2464,
+        -704
+      ],
+      "id": "8d1e3e8f-570a-42a0-8c51-078cabe3ea84",
+      "name": "Sticky Note1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Get Customer Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customer Signals": {
+      "main": [
+        [
+          {
+            "node": "Score Customers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Customers": {
+      "main": [
+        [
+          {
+            "node": "Save Risk Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Risk Score": {
+      "main": [
+        [
+          {
+            "node": "Save Score History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Score History": {
+      "main": [
+        [
+          {
+            "node": "Restore Scored Customers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Scored Customers": {
+      "main": [
+        [
+          {
+            "node": "Needs Intervention?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Intervention?": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Route by Path",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Check-in Email": {
+      "main": [
+        [
+          {
+            "node": "Validate Email Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Email Draft": {
+      "main": [
+        [
+          {
+            "node": "Draft Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Check-in Email": {
+      "main": [
+        [
+          {
+            "node": "Space Out Sends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Space Out Sends": {
+      "main": [
+        [
+          {
+            "node": "Log Intervention",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Intervention": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Briefing": {
+      "main": [
+        [
+          {
+            "node": "Briefing Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Path": {
+      "main": [
+        [
+          {
+            "node": "Write Account Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write Check-in Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Briefing Valid?": {
+      "main": [
+        [
+          {
+            "node": "Send Briefing to Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Valid?": {
+      "main": [
+        [
+          {
+            "node": "Send Check-in Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Failed Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Briefing to Telegram": {
+      "main": [
+        [
+          {
+            "node": "Log Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Briefing": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Account Briefing": {
+      "main": [
+        [
+          {
+            "node": "Validate Briefing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Failed Draft": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cancel Webhook": {
+      "main": [
+        [
+          {
+            "node": "Classify Cancel Reason",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Cancel Reason": {
+      "main": [
+        [
+          {
+            "node": "Clean Reason Category",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Reason Category": {
+      "main": [
+        [
+          {
+            "node": "Mark Customer Churned",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Customer Churned": {
+      "main": [
+        [
+          {
+            "node": "High Value Cancel?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Value Cancel?": {
+      "main": [
+        [
+          {
+            "node": "Alert High Value Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Cancel Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert High Value Cancel": {
+      "main": [
+        [
+          {
+            "node": "Respond to Cancel Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Winback Schedule": {
+      "main": [
+        [
+          {
+            "node": "Get Due Winbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Due Winbacks": {
+      "main": [
+        [
+          {
+            "node": "Pick Winback Angle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Winback Angle": {
+      "main": [
+        [
+          {
+            "node": "Loop Winbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Winbacks": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Write Winback Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Winback Email": {
+      "main": [
+        [
+          {
+            "node": "Validate Winback Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Winback Draft": {
+      "main": [
+        [
+          {
+            "node": "Winback Draft Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Winback Draft Valid?": {
+      "main": [
+        [
+          {
+            "node": "Send Winback Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Alert Failed Winback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Winback Email": {
+      "main": [
+        [
+          {
+            "node": "Space Out Winbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Space Out Winbacks": {
+      "main": [
+        [
+          {
+            "node": "Log Winback Touch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Winback Touch": {
+      "main": [
+        [
+          {
+            "node": "Loop Winbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Failed Winback": {
+      "main": [
+        [
+          {
+            "node": "Loop Winbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Replies": {
+      "main": [
+        [
+          {
+            "node": "Clean Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Reply": {
+      "main": [
+        [
+          {
+            "node": "Find Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Customer": {
+      "main": [
+        [
+          {
+            "node": "Classify Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Reply": {
+      "main": [
+        [
+          {
+            "node": "Decide Reply Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Reply Action": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Mark Won Back",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Pause Automation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Lost",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Add to Suppression",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Won Back": {
+      "main": [
+        [
+          {
+            "node": "Alert Won Back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pause Automation": {
+      "main": [
+        [
+          {
+            "node": "Alert Needs Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monday Report Schedule": {
+      "main": [
+        [
+          {
+            "node": "Weekly Numbers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Numbers": {
+      "main": [
+        [
+          {
+            "node": "Send Weekly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "a87d2428-927f-49c1-bcfd-1a980ef6194f",
+  "meta": {
+    "instanceId": "abee6a92bf7c18aade78aa4f094b56319470ffa8af75ccc010099e0ab5fb5b17"
+  },
+  "nodeGroups": [],
+  "id": "DbW3ckClXi4iu0ta",
+  "tags": []
+}
